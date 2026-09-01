@@ -1,0 +1,1345 @@
+# =============================================================================
+#  M5Stack CoreS3 SE + Module GNSS  —  ESPHome
+# =============================================================================
+#  Derived from M5Stack-CoreS3-SE-GNSS-Reference.md (2026-08-25).
+#
+#  Hardware wiring this file assumes (all [measured] in the reference doc):
+#    Internal I2C  SDA=GPIO12  SCL=GPIO11   -> AXP2101 0x34, AW9523 0x58,
+#                                              FT6336 0x38, BM8563 0x51,
+#                                              BMI270 0x69, BMP280 0x76
+#    Port A  I2C   SDA=GPIO2   SCL=GPIO1    -> empty, yours to use
+#    GNSS UART     RX=GPIO18  TX=GPIO17  38400 8N1   (DIP: RXD4 ON, TXD4 ON)
+#    LCD (ILI9342) SCLK=GPIO36 MOSI=GPIO37 DC=GPIO35 CS=GPIO3
+#                  reset via AW9523 P1_1 (pin 9), backlight via AXP2101 DLDO1
+#
+#  NOTE: Port C (G17/G18) is consumed by the GNSS module. Do not reuse.
+#  NOTE: flashing this REPLACES the factory app. Keep your head64k.bin/full.bin
+#        backup — ESPHome installs its own partition table.
+#
+#  Requires ESPHome 2026.1+ (mipi_spi display, bmi270/motion, bm8563).
+#  Create a secrets.yaml with: house_wifi_ssid, house_wifi_password,
+#  van_wifi_ssid, van_wifi_password, ap_password, cores3_gnss__encryption_key
+#
+#  LVGL VARIANT of m5stack-cores3-gnss.yaml. Identical hardware, sensors and
+#  leveling logic; the four hand-drawn display lambdas are replaced by an LVGL
+#  scene graph. LVGL is mutually exclusive with display `pages:`/`lambda:`/
+#  `auto_clear_enabled: true`, which is why this is a separate file.
+#
+#  Leveling math is vendored from LevelUp as ./leveling.h — keep the two files
+#  together. It is header-only and still passes LevelUp's own
+#  test/leveling/test_leveling.c unchanged (as C99 and as C++).
+# =============================================================================
+
+substitutions:
+  name: cores3-gnss
+  friendly_name: CoreS3 GNSS
+
+esphome:
+  name: ${name}
+  friendly_name: ${friendly_name}
+  min_version: 2026.1.0
+  includes:
+    - leveling.h              # vendored from LevelUp — see file header
+  on_boot:
+    # FT6336 needs ~300 ms after reset release before it answers on I2C.
+    # ESPHome's ft63x6 hard_reset_() releases reset and reads the chip ID with no
+    # delay in between, so it reads 0 and logs "touch driver failed to start"
+    # (without marking the component failed, so the follow-up config writes are
+    # silently lost too). Do the reset here instead and drop reset_pin from the
+    # touchscreen. Priority 700 lands after aw9523b (IO, 900) and the gpio switch
+    # (HARDWARE, 800) but before the touchscreen (DATA, 600).
+    # NB: this must be a lambda. The `delay:` action yields and lets setup carry
+    # on; vTaskDelay here actually blocks, which is the whole point.
+    - priority: 700
+      then:
+        - lambda: |-
+            id(touch_rst).turn_off();            // assert TOUCH_RST (active low)
+            vTaskDelay(pdMS_TO_TICKS(20));
+            id(touch_rst).turn_on();             // release
+            vTaskDelay(pdMS_TO_TICKS(300));      // FT6336 power-on time
+    - priority: 600
+      then:
+        - light.turn_on:
+            id: lcd_backlight
+            brightness: 80%
+    - priority: -100          # after everything is up
+      then:
+        - script.execute: apply_log_level
+
+esp32:
+  variant: esp32s3
+  flash_size: 16MB          # [measured] XMC 16 MB quad-SPI
+  cpu_frequency: 240MHz
+  framework:
+    type: esp-idf
+    sdkconfig_options:
+      CONFIG_ESP32S3_DATA_CACHE_64KB: "y"
+      CONFIG_ESP32S3_DATA_CACHE_LINE_64B: "y"
+      CONFIG_ESP32S3_INSTRUCTION_CACHE_32KB: "y"
+
+psram:
+  mode: quad                # CoreS3 uses quad PSRAM; octal would eat GPIO33-37
+  speed: 80MHz
+
+logger:
+  id: esp_logger
+  # `level:` is COMPILE time — anything more verbose is stripped by the
+  # preprocessor and no runtime switch can bring it back. Compile DEBUG in,
+  # boot at INFO, and raise it at runtime via the "Log Level" select below.
+  level: DEBUG
+  initial_level: INFO
+  # UART0 console is GPIO43/44; leave hardware_uart default so it does not
+  # fight the GNSS UART on GPIO17/18.
+
+api:
+  encryption:
+    key: !secret cores3_gnss__encryption_key
+ota:
+  - platform: esphome
+
+wifi:
+  # Two networks so the device roams between the house and the van without a
+  # reflash. Single-SSID would mean the device lands in the van, never joins,
+  # and cannot be fixed over the air because OTA needs the network.
+  # Secrets are named house_/van_ explicitly rather than using a bare
+  # `wifi_ssid`: the van HA already uses that name for the VAN network (its
+  # bt-proxy depends on it), so an unqualified name means different things on
+  # different build hosts. Explicit names let this file build unchanged on the
+  # laptop, the house HA, or the van HA.
+  # ESPHome sorts scan results by priority first, then RSSI. Both networks at
+  # the default priority 0 means the loudest wins — and parked on the drive the
+  # house AP beats the van's. The van network must therefore be explicitly
+  # preferred: it travels with the device and is the one its HA lives on.
+  # The house network stays as a fallback for when the van AP is powered down.
+  networks:
+    - ssid: !secret van_wifi_ssid
+      password: !secret van_wifi_password
+      priority: 10
+    - ssid: !secret house_wifi_ssid
+      password: !secret house_wifi_password
+      priority: 0
+  ap:
+    ssid: "${friendly_name} Fallback"
+    password: !secret ap_password
+
+captive_portal:
+
+# Device's own web UI at http://<ip>/ — the fallback for configuring the van
+# dimensions, zeroing and muting when Home Assistant is not reachable.
+# `local: true` embeds the JS/CSS in the firmware; without it the page pulls its
+# assets from an external CDN and is dead whenever the van has no internet.
+web_server:
+  port: 80
+  local: true
+  include_internal: true
+
+# -----------------------------------------------------------------------------
+#  M5Stack board-support components (PMIC + IO expander are not in core ESPHome)
+# -----------------------------------------------------------------------------
+external_components:
+  - source: github://m5stack/esphome-yaml/components
+    components: [axp2101, aw9523b, aw88298]
+    refresh: 1d
+
+# -----------------------------------------------------------------------------
+#  Buses
+# -----------------------------------------------------------------------------
+i2c:
+  - id: bsp_bus            # internal bus: PMIC, expander, touch, RTC, IMU, baro
+    sda: GPIO12
+    scl: GPIO11
+    frequency: 400kHz
+  - id: ext_bus            # Port A (Grove) — free for your own sensors
+    sda: GPIO2
+    scl: GPIO1
+    scan: true
+
+spi:
+  - id: spi_bus            # shared LCD / microSD bus
+    clk_pin: GPIO36
+    mosi_pin: GPIO37
+
+uart:
+  - id: gnss_uart
+    rx_pin: GPIO18         # module TX  (DIP RXD switch 4 -> mbus15)
+    tx_pin: GPIO17         # module RX  (DIP TXD switch 4 -> mbus16)
+    baud_rate: 38400       # NEO-M9N default
+    rx_buffer_size: 2048   # ~12 NMEA sentences/sec
+
+# -----------------------------------------------------------------------------
+#  Power management / IO expander
+# -----------------------------------------------------------------------------
+axp2101:
+  id: axp2101_pmu
+  i2c_id: bsp_bus
+
+aw9523b:
+  id: aw9523b_hub
+  i2c_id: bsp_bus
+  p0_drive_mode: PUSH_PULL
+
+output:
+  - platform: axp2101      # LCD backlight rail
+    type: range
+    channel: DLDO1
+    id: lcd_backlight_output
+    min_voltage: 2600
+    max_voltage: 3300
+  - platform: axp2101
+    channel: ALDO1
+    voltage: 1800
+  - platform: axp2101
+    channel: ALDO2
+    voltage: 3300
+  - platform: axp2101
+    channel: BLDO1
+    voltage: 2800
+  - platform: axp2101
+    channel: BLDO2
+    voltage: 1500
+
+light:
+  - platform: monochromatic
+    id: lcd_backlight
+    name: "LCD Backlight"
+    icon: "mdi:television"
+    entity_category: config
+    output: lcd_backlight_output
+    restore_mode: RESTORE_DEFAULT_ON
+    default_transition_length: 250ms
+
+  # M5GO Bottom2 LED bar (10x SK6812 on the M-Bus 5V rail, data on G5 = bus pin 8,
+  # per M5Stack's pinmap tool).
+  #
+  # THIS DOES NOT LIGHT THE LEDS — do not delete it anyway. Its actual job is to
+  # claim GPIO5 and hold it low. Undriven, that line floats, picks up noise, and
+  # latches the bar to full white: ~600 mA / 3 W of continuous draw that had the
+  # stack sitting ~10 C hotter and cycling the battery while plugged in. Removing
+  # this component brings all of that back.
+  #
+  # Addressing the LEDs was abandoned 2026-08-26 after trying G5/G10/G7/G6, both
+  # SK6812 and WS2812 timings, and 3- and 4-byte framing. The strip accepts
+  # commands and reports state; nothing ever lights. Kept internal so it does not
+  # surface in Home Assistant as a light that does nothing. If the other base
+  # turns out to behave differently, this is the place to start.
+  - platform: esp32_rmt_led_strip
+    id: led_bar
+    internal: true
+    pin: GPIO5            # M-Bus pin 8
+    num_leds: 10
+    chipset: SK6812
+    channel_colors: GRBW   # 4 bytes/LED — SK6812-RGBW order
+    default_transition_length: 0s
+    restore_mode: ALWAYS_OFF
+
+
+switch:
+  - platform: gpio         # 5V boost converter
+    id: boost_en
+    pin:
+      aw9523b_id: aw9523b_hub
+      number: 15
+    internal: true
+    restore_mode: ALWAYS_ON
+  - platform: gpio         # M-Bus power out — equivalent to M5.Power.setExtOutput(true)
+    id: bus_out_en         # the GNSS module is powered from the bus, so keep this ON
+    pin:
+      aw9523b_id: aw9523b_hub
+      number: 1
+    internal: true
+    restore_mode: ALWAYS_ON
+  - platform: gpio         # AW9523 peripheral reset line, must stay released
+    id: aw_rst
+    pin:
+      aw9523b_id: aw9523b_hub
+      number: 2
+    internal: true
+    restore_mode: ALWAYS_ON
+
+  - platform: gpio         # P0_0 = TOUCH_RST, released by the on_boot handler
+    id: touch_rst           # above; see the comment there for why not reset_pin
+    pin:
+      aw9523b_id: aw9523b_hub
+      number: 0
+    internal: true
+    restore_mode: ALWAYS_ON
+
+  - platform: template       # silence the leveling beeper
+    id: beep_mute            # ON = muted. Defaults to muted on a device with no
+    name: "Beeper Muted"     # stored state; otherwise the last choice is restored.
+    icon: "mdi:volume-off"
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    entity_category: config
+
+# -----------------------------------------------------------------------------
+#  GNSS — u-blox NEO-M9N, NMEA 0183
+# -----------------------------------------------------------------------------
+gps:
+  - id: gnss
+    uart_id: gnss_uart
+    update_interval: 5s
+    latitude:
+      id: gps_lat
+      name: "Latitude"
+    longitude:
+      id: gps_lon
+      name: "Longitude"
+    altitude:
+      id: gps_alt
+      name: "Altitude"
+    speed:
+      id: gps_speed
+      name: "Speed"
+    course:
+      id: gps_course
+      name: "Course"
+    satellites:
+      id: gps_sats
+      name: "Satellites"
+    hdop:
+      id: gps_hdop
+      name: "HDOP"
+
+time:
+  - platform: gps          # UTC from the NEO-M9N once it has a fix
+    id: gps_time
+    gps_id: gnss
+    on_time_sync:
+      then:
+        - bm8563.write_time:   # push GNSS time into the BM8563 RTC
+            id: rtc_time
+  - platform: bm8563        # survives power loss, seeds the clock before fix
+    id: rtc_time
+    i2c_id: bsp_bus
+    address: 0x51
+    update_interval: never
+
+# -----------------------------------------------------------------------------
+#  Module GNSS on-board sensors
+# -----------------------------------------------------------------------------
+motion:
+  - platform: bmi270
+    id: imu
+    i2c_id: bsp_bus
+    address: 0x69          # [measured] on-module slide switch position; 0x68 is the alternative
+    # Measured on hardware 2026-08-26 with calibration cleared:
+    #   flat screen-up  ax  0.00  ay -0.02  az -1.00
+    #   lift TOP edge   ax  0.00  ay +0.47  az -0.89   (pure Y)
+    #   lift RIGHT edge ax -0.53  ay +0.04  az -0.84   (pure X)
+    # So the BMI270 is square to the screen but rotated 180 deg about the
+    # screen's vertical axis: X_imu = -X_screen, Y_imu = +Y_screen,
+    # Z_imu = -Z_screen. This puts it back in the screen frame (det +1).
+    axis_map: {x: -x, y: y, z: -z}
+    accelerometer_range: 4G
+    gyroscope_range: 2000DPS
+    update_interval: 50ms      # 20 Hz feeds the median/EMA chain below
+
+binary_sensor:
+  - platform: template
+    id: gps_fix
+    name: "GPS Fix"
+    device_class: connectivity
+    lambda: |-
+      auto &tg = id(gnss).get_tiny_gps();
+      return tg.location.isValid() && tg.location.age() < 10000;
+
+  - platform: template
+    id: van_is_level
+    name: "Van Is Level"
+    icon: "mdi:spirit-level"
+    lambda: 'return g_lvl.guidance_available && g_lvl.is_level;'
+
+  - platform: template
+    id: van_moving
+    name: "Moving"
+    device_class: moving
+    lambda: 'return g_is_moving;'
+
+sensor:
+  # --- PMIC / battery ---------------------------------------------------------
+  - platform: axp2101
+    id: axp2101_sensor
+    battery_level:
+      id: batt_level
+      name: "Battery Level"
+    battery_voltage:
+      id: batt_voltage
+      name: "Battery Voltage"
+    axp_temperature:
+      id: axp_temp
+      name: "AXP2101 Temperature"
+    battery_charging:
+      id: batt_charging
+      name: "Battery Charging"
+
+  # --- BMP280 barometer (GNSS module, 0x76) -----------------------------------
+  - platform: bmp280_i2c
+    i2c_id: bsp_bus
+    address: 0x76
+    update_interval: 10s
+    iir_filter: 16x
+    temperature:
+      id: baro_temp
+      name: "Barometer Temperature"
+    pressure:
+      id: baro_press
+      name: "Pressure"
+
+  # --- BMI270 IMU (GNSS module, 0x69) -----------------------------------------
+  - platform: motion
+    motion_id: imu
+    type: acceleration_x
+    id: acc_x
+    name: "Accel X"
+    filters: [throttle: 5s]
+  - platform: motion
+    motion_id: imu
+    type: acceleration_y
+    id: acc_y
+    name: "Accel Y"
+    filters: [throttle: 5s]
+  - platform: motion
+    motion_id: imu
+    type: acceleration_z
+    id: acc_z
+    name: "Accel Z"
+    filters: [throttle: 5s]
+  - platform: motion
+    motion_id: imu
+    type: gyroscope_x
+    id: gyr_x
+    name: "Gyro X"
+    filters: [throttle: 5s]
+  - platform: motion
+    motion_id: imu
+    type: gyroscope_y
+    id: gyr_y
+    name: "Gyro Y"
+    filters: [throttle: 5s]
+  - platform: motion
+    motion_id: imu
+    type: gyroscope_z
+    id: gyr_z
+    name: "Gyro Z"
+    filters: [throttle: 5s]
+  # Fast internal path for the level display and the beeper. This is LevelUp's
+  # imu_task.c filter chain: median-5 spike rejection then an EMA. ESPHome has
+  # both natively, so only the deadband/hysteresis stage stays as vendored C.
+  - platform: motion
+    motion_id: imu
+    type: pitch
+    id: imu_pitch
+    internal: true
+    filters:
+      - median: {window_size: 5, send_every: 1, send_first_at: 1}
+      - exponential_moving_average: {alpha: 0.3, send_every: 1}
+  - platform: motion
+    motion_id: imu
+    type: roll
+    id: imu_roll
+    internal: true
+    filters:
+      - median: {window_size: 5, send_every: 1, send_first_at: 1}
+      - exponential_moving_average: {alpha: 0.3, send_every: 1}
+
+  # Throttled copies for Home Assistant — van frame, after deadband.
+  - platform: template
+    id: van_tilt_side
+    name: "Tilt Left-High"
+    unit_of_measurement: "°"
+    accuracy_decimals: 2
+    update_interval: 10s
+    lambda: 'return g_lvl.guidance_available ? g_lvl.left_high_deg : NAN;'
+  - platform: template
+    id: van_tilt_end
+    name: "Tilt Front-High"
+    unit_of_measurement: "°"
+    accuracy_decimals: 2
+    update_interval: 10s
+    lambda: 'return g_lvl.guidance_available ? g_lvl.front_high_deg : NAN;'
+
+  # Leveling guidance for Home Assistant.
+  - platform: template
+    id: lift_fl
+    name: "Lift Front Left"
+    unit_of_measurement: in
+    accuracy_decimals: 2
+    update_interval: 10s
+    lambda: 'return g_lvl.guidance_available ? g_lvl.corner_lift_in[CORNER_FL] : NAN;'
+  - platform: template
+    id: lift_fr
+    name: "Lift Front Right"
+    unit_of_measurement: in
+    accuracy_decimals: 2
+    update_interval: 10s
+    lambda: 'return g_lvl.guidance_available ? g_lvl.corner_lift_in[CORNER_FR] : NAN;'
+  - platform: template
+    id: lift_rl
+    name: "Lift Rear Left"
+    unit_of_measurement: in
+    accuracy_decimals: 2
+    update_interval: 10s
+    lambda: 'return g_lvl.guidance_available ? g_lvl.corner_lift_in[CORNER_RL] : NAN;'
+  - platform: template
+    id: lift_rr
+    name: "Lift Rear Right"
+    unit_of_measurement: in
+    accuracy_decimals: 2
+    update_interval: 10s
+    lambda: 'return g_lvl.guidance_available ? g_lvl.corner_lift_in[CORNER_RR] : NAN;'
+  - platform: template
+    id: lift_max
+    name: "Max Lift Needed"
+    unit_of_measurement: in
+    accuracy_decimals: 2
+    update_interval: 10s
+    lambda: 'return g_lvl.guidance_available ? g_lvl.max_lift_in : NAN;'
+  - platform: bmi270
+    bmi270_id: imu
+    type: temperature
+    id: imu_temp
+    name: "IMU Temperature"
+    filters: [throttle: 30s]
+
+  # --- Host ------------------------------------------------------------------
+  - platform: wifi_signal
+    id: wifi_rssi
+    name: "WiFi Signal"
+    update_interval: 30s
+  - platform: uptime
+    id: sys_uptime
+    name: "Uptime"
+    update_interval: 10s
+
+text_sensor:
+  - platform: template
+    id: guidance_text
+    name: "Leveling Guidance"
+    icon: "mdi:sign-direction"
+    update_interval: 10s
+    lambda: |-
+      const auto &g = g_lvl;
+      char b[64];
+      if (!g.guidance_available) return std::string("Set van dimensions");
+      if (g.is_level)            return std::string("Level");
+      if (id(level_mode).active_index().value_or(0) == 1) {
+        const char *where = g.ramp_axis_is_roll
+            ? (g.ramp_lift_left ? "left wheels" : "right wheels")
+            : (g.ramp_lift_front ? "front wheels" : "rear wheels");
+        snprintf(b, sizeof(b), "Ramp under %s %.1f in", where, g.ramp_target_in);
+      } else {
+        snprintf(b, sizeof(b), "Raise %s %.1f in",
+                 leveling_corner_name(g.worst_corner), g.max_lift_in);
+      }
+      return std::string(b);
+
+  - platform: wifi_info
+    ip_address:
+      id: wifi_ip
+      name: "IP Address"
+    ssid:
+      id: wifi_ssid
+      name: "SSID"
+
+# -----------------------------------------------------------------------------
+#  Van configuration — replaces LevelUp's captive-portal wizard.
+#  These show up in Home Assistant AND in ESPHome's own web server, so the
+#  device stays configurable if HA is down.
+# -----------------------------------------------------------------------------
+number:
+  - platform: template
+    id: van_trackwidth
+    name: "Track Width"
+    icon: "mdi:arrow-left-right"
+    unit_of_measurement: in
+    min_value: 30
+    max_value: 120
+    step: 0.5
+    initial_value: 68
+    restore_value: true
+    optimistic: true
+    mode: box
+    entity_category: config
+  - platform: template
+    id: van_wheelbase
+    name: "Wheelbase"
+    icon: "mdi:arrow-up-down"
+    unit_of_measurement: in
+    min_value: 60
+    max_value: 300
+    step: 0.5
+    initial_value: 148
+    restore_value: true
+    optimistic: true
+    mode: box
+    entity_category: config
+  - platform: template
+    id: beep_volume
+    name: "Beeper Volume"
+    icon: "mdi:volume-high"
+    unit_of_measurement: "%"
+    min_value: 0
+    max_value: 100
+    step: 5
+    initial_value: 60
+    restore_value: true
+    optimistic: true
+    entity_category: config
+    on_value:
+      - lambda: 'id(beeper).set_gain(x / 100.0f);'
+
+select:
+  - platform: template
+    id: van_front
+    name: "Front Of Van"
+    icon: "mdi:van-passenger"
+    options:
+      - "Top of screen"
+      - "Bottom of screen"
+      - "Left of screen"
+      - "Right of screen"
+    initial_option: "Top of screen"
+    restore_value: true
+    optimistic: true
+    entity_category: config
+  - platform: template
+    id: log_level
+    name: "Log Level"
+    icon: "mdi:text-box-search-outline"
+    options: ["ERROR", "WARN", "INFO", "DEBUG"]
+    initial_option: "INFO"
+    restore_value: true
+    optimistic: true
+    entity_category: config
+    on_value:
+      - script.execute: apply_log_level
+
+  - platform: template
+    id: level_mode
+    name: "Leveling Mode"
+    icon: "mdi:car-lifted-pickup"
+    options: ["Blocks", "Ramps"]
+    initial_option: "Blocks"
+    restore_value: true
+    optimistic: true
+    entity_category: config
+
+button:
+  - platform: template
+    id: btn_zero
+    name: "Zero Level Here"
+    icon: "mdi:target"
+    on_press:
+      - if:
+          condition:
+            lambda: 'return g_is_moving;'
+          then:
+            - logger.log:
+                level: WARN
+                format: "Refusing to zero while moving"
+          else:
+            # Rotates the IMU calibration matrix so the current attitude reads
+            # flat, and persists it to NVS. Replaces LevelUp's nvs_load_offsets
+            # / nvs_save_offsets / ui_apply_offsets entirely.
+            - motion.calibrate_level:
+                id: imu
+                save: true
+                on_success:
+                  - lambda: 'g_roll_latched = false; g_pitch_latched = false;'
+                  - logger.log: "Zeroed and saved"
+                on_error:
+                  - logger.log:
+                      level: ERROR
+                      format: "Zero failed"
+  - platform: template
+    id: btn_clear_cal
+    name: "Clear Level Calibration"
+    icon: "mdi:target-variant"
+    entity_category: config
+    on_press:
+      - motion.clear_calibration:
+          id: imu
+          save: true
+
+# -----------------------------------------------------------------------------
+#  Runtime log level. The select only persists the *choice*; the logger itself
+#  always starts at `initial_level`, so re-apply it once at boot.
+# -----------------------------------------------------------------------------
+script:
+  - id: apply_log_level
+    then:
+      - lambda: |-
+          static const uint8_t LV[4] = {
+              ESPHOME_LOG_LEVEL_ERROR, ESPHOME_LOG_LEVEL_WARN,
+              ESPHOME_LOG_LEVEL_INFO,  ESPHOME_LOG_LEVEL_DEBUG };
+          size_t i = id(log_level).active_index().value_or(2);
+          if (i > 3) i = 2;
+          id(esp_logger).set_log_level(LV[i]);
+          ESP_LOGI("loglevel", "runtime log level -> %s",
+                   id(log_level).current_option().c_str());
+
+# -----------------------------------------------------------------------------
+#  Audio — AW88298 amp on the internal I2C bus, speaker on the shared I2S bus.
+#  GPIO13 is I2S DOUT; safe only because the GNSS module uses TXD switch 4
+#  (G17). TXD switch 3 would put the GNSS on G13 and collide here.
+# -----------------------------------------------------------------------------
+i2s_audio:
+  id: i2s_bus
+  i2s_lrclk_pin: GPIO33
+  i2s_bclk_pin: GPIO34
+  i2s_mclk_pin:
+    number: GPIO0
+    ignore_strapping_warning: true
+
+audio_dac:
+  - platform: aw88298
+    id: aw88298_dac
+    i2c_id: bsp_bus
+    sample_rate: 48000
+
+speaker:
+  - platform: i2s_audio
+    id: i2s_speaker
+    i2s_audio_id: i2s_bus
+    dac_type: external
+    i2s_dout_pin: GPIO13
+    audio_dac: aw88298_dac
+
+rtttl:
+  id: beeper
+  speaker: i2s_speaker
+  gain: 60%
+
+# -----------------------------------------------------------------------------
+#  Leveling loop + adaptive beeper
+#  Cadence curve is LevelUp's audio_beep_interval_ms(): 120 ms at 8 deg of
+#  error out to 1200 ms at level, with the fast "centered" cadence suppressed
+#  while moving.
+# -----------------------------------------------------------------------------
+interval:
+  - interval: 100ms
+    id: leveling_tick
+    then:
+      - lambda: |-
+          // GNSS ground speed is a far better "stationary" signal than the
+          // accel-magnitude variance detector LevelUp used. No fix -> assume
+          // parked, since leveling only happens stopped.
+          auto &tg = id(gnss).get_tiny_gps();
+          bool have_fix = tg.location.isValid() && tg.location.age() < 10000;
+          // Enter "moving" only above 8 km/h and only after ~0.5 s sustained;
+          // leave below 3 km/h. A bare `> 3.0f` flickers on GNSS noise, which
+          // would suppress the fast beep cadence and block the Zero button at
+          // exactly the wrong moment.
+          float kmh = tg.speed.isValid() ? tg.speed.kmph() : 0.0f;
+          if (have_fix && kmh > 8.0f) {
+            if (g_move_count < 10) g_move_count++;
+          } else if (!have_fix || kmh < 3.0f) {
+            if (g_move_count > 0) g_move_count--;
+          }
+          g_is_moving = g_move_count >= 5;      // 5 x 100 ms tick
+          bool stationary = !g_is_moving;
+
+          float r = id(imu_roll).state;
+          float p = id(imu_pitch).state;
+          if (std::isnan(r) || std::isnan(p)) return;
+
+          r = leveling_deadband_hyst(r, 0.8f, 1.2f, stationary, &g_roll_latched);
+          p = leveling_deadband_hyst(p, 0.8f, 1.2f, stationary, &g_pitch_latched);
+
+          leveling_orient_t o = leveling_orient_from_front(
+              (leveling_front_t) id(van_front).active_index().value_or(0));
+          leveling_mode_t m = (id(level_mode).active_index().value_or(0) == 1)
+                              ? LEVEL_MODE_RAMPS : LEVEL_MODE_BLOCKS;
+
+          // NOTE the swapped arguments. LevelUp's QMI8658 sat 90 deg rotated
+          // from our BMI270, so its "pitch" was the front/back axis and its
+          // "roll" the left/right one. With the axis_map above, ours is the
+          // other way round: roll tracks top/bottom, pitch tracks left/right.
+          // Passing (p, r) instead of (r, p) reconciles the two conventions and
+          // is equivalent to flipping front_is_pitch_axis in all four rows of
+          // leveling_orient_from_front() -- verified for all four orientations.
+          // Doing it here keeps leveling.h byte-identical to LevelUp's original,
+          // so its unit tests stay meaningful.
+          g_lvl = leveling_compute(p, r,
+                                     id(van_trackwidth).state,
+                                     id(van_wheelbase).state,
+                                     m, o);
+
+          // --- adaptive beeper ---
+          if (id(beep_mute).state || !g_lvl.guidance_available) return;
+          uint32_t iv = leveling_beep_interval_ms(g_lvl.left_high_deg,
+                                                  g_lvl.front_high_deg,
+                                                  stationary);
+          uint32_t now = esphome::millis();
+          if (now - g_last_beep_ms >= iv) {
+            g_last_beep_ms = now;
+            id(beeper).play("lvl:d=32,o=6,b=200:d");
+          }
+
+  # --- LVGL refresh: raw LVGL calls, run from the main loop where the lvgl
+  # component itself lives, so no explicit locking is needed. ---
+  - interval: 250ms
+    id: lvgl_tick
+    then:
+      - lambda: |-
+          char b[64];
+          const auto &g = g_lvl;
+          bool ok  = g.guidance_available;
+          bool lev = ok && g.is_level;
+
+          // ---- header ----
+          lv_obj_set_style_bg_color(id(hdr),
+              lv_color_hex(!ok ? 0xE05252 : (lev ? 0x35C46A : 0xE0A030)), LV_PART_MAIN);
+          lv_label_set_text(id(lbl_status),
+              !ok ? "SET DIMENSIONS" : (lev ? "LEVEL" : "ADJUST"));
+          if (id(batt_level).has_state()) {
+            snprintf(b, sizeof(b), "%.0f%%", id(batt_level).state);
+            lv_label_set_text(id(lbl_batt), b);
+          }
+
+          // ---- bubble: floats toward the HIGH corner ----
+          if (ok) {
+            const float scale = 57.0f / 6.0f;   // full deflection at 6 deg
+            float dx = -g.left_high_deg  * scale;
+            float dy = -g.front_high_deg * scale;
+            float mag = sqrtf(dx * dx + dy * dy);
+            if (mag > 51.0f) { dx *= 51.0f / mag; dy *= 51.0f / mag; }
+            lv_obj_align(id(bub), LV_ALIGN_CENTER, (int) dx, (int) dy);
+            lv_obj_set_style_bg_color(id(bub),
+                lv_color_hex(lev ? 0x35C46A : 0xE0A030), LV_PART_MAIN);
+          }
+
+          // ---- guidance panel ----
+          bool ramps = (id(level_mode).active_index().value_or(0) == 1);
+          if (!ok) {
+            lv_label_set_text(id(lbl_mode), "SET VAN DIMENSIONS");
+            lv_label_set_text(id(lbl_c0), "");
+            lv_label_set_text(id(lbl_c1), "");
+            lv_label_set_text(id(lbl_c2), "");
+            lv_label_set_text(id(lbl_c3), "");
+            lv_label_set_text(id(lbl_action), "Track width and");
+            lv_label_set_text(id(lbl_amount), "");
+          } else if (ramps) {
+            lv_label_set_text(id(lbl_mode), "RAMPS - DRIVE ONTO");
+            lv_label_set_text(id(lbl_c0), "");
+            lv_label_set_text(id(lbl_c1), "");
+            lv_label_set_text(id(lbl_c2), "");
+            lv_label_set_text(id(lbl_c3), "");
+            if (lev) {
+              lv_label_set_text(id(lbl_action), "NO RAMPS NEEDED");
+              lv_label_set_text(id(lbl_amount), "");
+            } else {
+              const char *where = g.ramp_axis_is_roll
+                  ? (g.ramp_lift_left ? "LEFT WHEELS" : "RIGHT WHEELS")
+                  : (g.ramp_lift_front ? "FRONT WHEELS" : "REAR WHEELS");
+              lv_label_set_text(id(lbl_action), where);
+              snprintf(b, sizeof(b), "%.1f\"", g.ramp_target_in);
+              lv_label_set_text(id(lbl_amount), b);
+            }
+          } else {
+            lv_label_set_text(id(lbl_mode), "BLOCKS - RAISE (in)");
+            const char *cn[4] = {"FL", "FR", "RL", "RR"};
+            lv_obj_t *cl[4] = {id(lbl_c0), id(lbl_c1), id(lbl_c2), id(lbl_c3)};
+            for (int i = 0; i < 4; i++) {
+              snprintf(b, sizeof(b), "%s %.1f", cn[i], g.corner_lift_in[i]);
+              lv_label_set_text(cl[i], b);
+              bool worst = (!lev && i == (int) g.worst_corner && g.max_lift_in > 0.05f);
+              lv_obj_set_style_text_color(cl[i],
+                  lv_color_hex(worst ? 0xE0A030 : 0xE8EDF2), LV_PART_MAIN);
+            }
+            if (lev) {
+              lv_label_set_text(id(lbl_action), "LEVEL");
+              lv_label_set_text(id(lbl_amount), "");
+            } else {
+              snprintf(b, sizeof(b), "RAISE %s", leveling_corner_name(g.worst_corner));
+              lv_label_set_text(id(lbl_action), b);
+              snprintf(b, sizeof(b), "%.1f\"", g.max_lift_in);
+              lv_label_set_text(id(lbl_amount), b);
+            }
+          }
+
+          // ---- footer ----
+          if (ok) {
+            snprintf(b, sizeof(b), "SIDE %+.1f\u00B0   END %+.1f\u00B0",
+                     g.left_high_deg, g.front_high_deg);
+            lv_label_set_text(id(lbl_tilt), b);
+          }
+          snprintf(b, sizeof(b), "%s   %s   %s",
+                   id(level_mode).current_option().c_str(),
+                   g_is_moving ? "MOVING" : "PARKED",
+                   id(beep_mute).state ? "MUTED" : "BEEP ON");
+          lv_label_set_text(id(lbl_state), b);
+
+          // ---- GNSS page ----
+          auto &tg = id(gnss).get_tiny_gps();
+
+          // Course over ground. Only meaningful while actually travelling, so
+          // everything below falls back to "--" when stationary.
+          static const char *const CARD16[16] = {
+              "N","NNE","NE","ENE","E","ESE","SE","SSE",
+              "S","SSW","SW","WSW","W","WNW","NW","NNW"};
+          bool cog_ok = g_is_moving && tg.course.isValid();
+          float cog_deg = cog_ok ? tg.course.deg() : 0.0f;
+          const char *cog_card = cog_ok
+              ? CARD16[((int) ((cog_deg + 11.25f) / 22.5f)) % 16] : "--";
+          char cog_txt[16];
+          if (cog_ok) snprintf(cog_txt, sizeof(cog_txt), "%s %03.0f", cog_card, cog_deg);
+          else        snprintf(cog_txt, sizeof(cog_txt), "--");
+          bool fix  = tg.location.isValid() && tg.location.age() < 10000;
+          bool data = tg.charsProcessed() > 10;
+          lv_obj_set_style_bg_color(id(hdr2),
+              lv_color_hex(fix ? 0x35C46A : (data ? 0xE0A030 : 0xE05252)), LV_PART_MAIN);
+          lv_label_set_text(id(lbl_gfix),
+              fix ? "3D/2D FIX" : (data ? "NMEA, NO FIX" : "NO NMEA"));
+          if (fix) {
+            snprintf(b, sizeof(b), "%11.6f", tg.location.lat());
+            lv_label_set_text(id(lbl_lat), b);
+            snprintf(b, sizeof(b), "%11.6f", tg.location.lng());
+            lv_label_set_text(id(lbl_lon), b);
+          }
+          snprintf(b, sizeof(b), "SATS %u    HDOP %.2f",
+                   (unsigned) tg.satellites.value(),
+                   tg.hdop.isValid() ? tg.hdop.hdop() : 99.99);
+          lv_label_set_text(id(lbl_gnss_a), b);
+          snprintf(b, sizeof(b), "ALT %.0fm  SPD %.1f  COG %s",
+                   tg.altitude.isValid() ? tg.altitude.meters() : 0.0,
+                   tg.speed.isValid() ? tg.speed.kmph() : 0.0,
+                   cog_txt);
+          lv_label_set_text(id(lbl_gnss_b), b);
+          if (tg.time.isValid()) {
+            snprintf(b, sizeof(b), "UTC %02d:%02d:%02d   fix age %.1fs",
+                     tg.time.hour(), tg.time.minute(), tg.time.second(),
+                     tg.location.age() / 1000.0f);
+            lv_label_set_text(id(lbl_gnss_c), b);
+          }
+          snprintf(b, sizeof(b), "chars %lu  fixes %lu  csum-fail %lu",
+                   (unsigned long) tg.charsProcessed(),
+                   (unsigned long) tg.sentencesWithFix(),
+                   (unsigned long) tg.failedChecksum());
+          lv_label_set_text(id(lbl_gnss_d), b);
+
+          // ---- COMPASS page ----
+          lv_label_set_text(id(lbl_cmp_card), cog_card);
+          lv_label_set_text(id(lbl_cmp_hdr),
+              fix ? (g_is_moving ? "TRAVELLING" : "STATIONARY") : "NO FIX");
+          if (cog_ok) {
+            snprintf(b, sizeof(b), "%03.0f\u00B0", cog_deg);
+            lv_label_set_text(id(lbl_cmp_deg), b);
+          } else {
+            lv_label_set_text(id(lbl_cmp_deg), "--");
+          }
+          snprintf(b, sizeof(b), "%.1f km/h",
+                   tg.speed.isValid() ? tg.speed.kmph() : 0.0);
+          lv_label_set_text(id(lbl_cmp_spd), b);
+          lv_label_set_text(id(lbl_cmp_state),
+              g_is_moving ? "MOVING" : "STATIONARY");
+          lv_label_set_text(id(lbl_cmp_note),
+              cog_ok ? "course over ground" : "needs motion");
+
+          // Needle: 5-point polyline (tail, tip, barb, tip, barb) rewritten in
+          // place. Screen Y is inverted, hence -cos for the north component.
+          {
+            static lv_point_precise_t np[5];
+            lv_obj_t *nd = id(cmp_needle).obj;
+            if (cog_ok) {
+              const float C = 88.0f, RT = 66.0f, RB = 22.0f, BL = 18.0f;
+              float a = cog_deg * 3.14159265f / 180.0f;
+              float sx = sinf(a), cy = -cosf(a);
+              float tx = C + RT * sx,      ty = C + RT * cy;
+              float bx = C - RB * sx,      by = C - RB * cy;
+              float a1 = a + 2.618f, a2 = a - 2.618f;   // +/-150 deg
+              np[0].x = (lv_value_precise_t) bx; np[0].y = (lv_value_precise_t) by;
+              np[1].x = (lv_value_precise_t) tx; np[1].y = (lv_value_precise_t) ty;
+              np[2].x = (lv_value_precise_t) (tx + BL * sinf(a1));
+              np[2].y = (lv_value_precise_t) (ty - BL * cosf(a1));
+              np[3].x = (lv_value_precise_t) tx; np[3].y = (lv_value_precise_t) ty;
+              np[4].x = (lv_value_precise_t) (tx + BL * sinf(a2));
+              np[4].y = (lv_value_precise_t) (ty - BL * cosf(a2));
+              lv_line_set_points(nd, np, 5);
+              lv_obj_remove_flag(nd, LV_OBJ_FLAG_HIDDEN);
+            } else {
+              lv_obj_add_flag(nd, LV_OBJ_FLAG_HIDDEN);
+            }
+          }
+
+          // ---- SYSTEM page ----
+          snprintf(b, sizeof(b), "SSID   %s",
+                   id(wifi_ssid).state.empty() ? "--" : id(wifi_ssid).state.c_str());
+          lv_label_set_text(id(lbl_sys_a), b);
+          snprintf(b, sizeof(b), "IP     %s",
+                   id(wifi_ip).state.empty() ? "--" : id(wifi_ip).state.c_str());
+          lv_label_set_text(id(lbl_sys_b), b);
+          snprintf(b, sizeof(b), "RSSI   %.0f dBm", id(wifi_rssi).state);
+          lv_label_set_text(id(lbl_sys_c), b);
+          {
+            uint32_t up = (uint32_t) id(sys_uptime).state;
+            snprintf(b, sizeof(b), "UPTIME %ud %02u:%02u:%02u",
+                     (unsigned) (up / 86400), (unsigned) ((up % 86400) / 3600),
+                     (unsigned) ((up % 3600) / 60), (unsigned) (up % 60));
+            lv_label_set_text(id(lbl_sys_d), b);
+          }
+          snprintf(b, sizeof(b), "BATT   %.0f%%  %.2f V%s",
+                   id(batt_level).state, id(batt_voltage).state,
+                   id(batt_charging).state ? "  charging" : "");
+          lv_label_set_text(id(lbl_sys_e), b);
+
+# Fonts — LVGL references these by id via `text_font:`.
+font:
+  - file: {type: gfonts, family: Figtree, weight: 700}
+    id: f_head
+    size: 15
+    glyphsets: [GF_Latin_Core]
+  - file: {type: gfonts, family: Figtree, weight: 600}
+    id: f_label
+    size: 11
+    glyphsets: [GF_Latin_Core]
+    glyphs: ["°"]
+  - file: {type: gfonts, family: "Roboto Mono", weight: 500}
+    id: f_val
+    size: 17
+    glyphsets: [GF_Latin_Core]
+    ignore_missing_glyphs: true
+    glyphs: ["°"]
+  - file: {type: gfonts, family: "Roboto Mono", weight: 700}
+    id: f_big
+    size: 20
+    glyphsets: [GF_Latin_Core]
+    ignore_missing_glyphs: true
+  - file: {type: gfonts, family: Figtree, weight: 700}
+    id: f_mid
+    size: 20
+    glyphsets: [GF_Latin_Core]
+  - file: {type: gfonts, family: "Roboto Mono", weight: 700}
+    id: f_huge
+    size: 30
+    glyphsets: [GF_Latin_Core]
+    ignore_missing_glyphs: true
+  - file: {type: gfonts, family: "Roboto Mono", weight: 400}
+    id: f_tiny
+    size: 12
+    glyphsets: [GF_Latin_Core]
+    ignore_missing_glyphs: true
+    glyphs: ["°"]
+
+# -----------------------------------------------------------------------------
+#  Display — hardware only. With LVGL there is no update_interval, no
+#  auto_clear_enabled and no pages/lambda; LVGL owns the framebuffer.
+# -----------------------------------------------------------------------------
+display:
+  - platform: mipi_spi
+    model: M5CORE           # ILI9342C, 320x240
+    id: lcd
+    spi_id: spi_bus
+    dc_pin: GPIO35
+    cs_pin:
+      number: GPIO3
+      ignore_strapping_warning: true
+    reset_pin:
+      aw9523b_id: aw9523b_hub
+      number: 9             # P1_1 = LCD_RST
+    data_rate: 40MHz
+    invert_colors: true
+
+lvgl:
+  displays: [lcd]
+  buffer_size: 25%          # 320x240x2 = 150 kB full frame; 25% lives in PSRAM
+  bg_color: 0x101418
+  text_color: 0xE8EDF2
+  pages:
+    # ---------------------------------------------------------------- LEVEL --
+    - id: pg_level
+      bg_color: 0x101418
+      bg_opa: COVER
+      # Swipe left = forward, swipe right = back. page_wrap defaults true,
+      # so it cycles round at either end.
+      on_swipe_left:
+        - lvgl.page.next:
+            animation: MOVE_LEFT
+            time: 200ms
+      on_swipe_right:
+        - lvgl.page.previous:
+            animation: MOVE_RIGHT
+            time: 200ms
+      widgets:
+        - obj:
+            id: hdr
+            x: 0
+            y: 0
+            width: 320
+            height: 24
+            radius: 0
+            border_width: 0
+            pad_all: 0
+            bg_color: 0xE0A030
+            bg_opa: COVER
+            widgets:
+              - label: {id: lbl_title,  x: 6,   y: 4, text: "LEVEL", text_font: f_head,  text_color: 0x101418}
+              - label: {id: lbl_status, x: 78,  y: 6, text: "",      text_font: f_label, text_color: 0x101418}
+              - label: {id: lbl_batt,   x: 262, y: 6, text: "",      text_font: f_label, text_color: 0x101418}
+
+        # ---- bubble vial ----
+        - obj:
+            id: vial
+            x: 8
+            y: 32
+            width: 140
+            height: 140
+            radius: 70
+            pad_all: 0
+            bg_color: 0x1B2128
+            bg_opa: COVER
+            border_color: 0x7A8794
+            border_width: 2
+            widgets:
+              - obj:
+                  align: CENTER
+                  width: 92
+                  height: 92
+                  radius: 46
+                  pad_all: 0
+                  bg_opa: TRANSP
+                  border_color: 0x2A323C
+                  border_width: 1
+              - obj:
+                  align: CENTER
+                  width: 44
+                  height: 44
+                  radius: 22
+                  pad_all: 0
+                  bg_opa: TRANSP
+                  border_color: 0x35C46A
+                  border_width: 2
+              - obj:
+                  id: bub
+                  align: CENTER
+                  width: 26
+                  height: 26
+                  radius: 13
+                  pad_all: 0
+                  bg_color: 0xE0A030
+                  bg_opa: COVER
+                  border_width: 0
+
+        # ---- guidance panel ----
+        - label: {id: lbl_mode,   x: 156, y: 32,  text: "",  text_font: f_label, text_color: 0x7A8794}
+        - label: {id: lbl_c0,     x: 158, y: 50,  text: "",  text_font: f_val,   text_color: 0xE8EDF2}
+        - label: {id: lbl_c1,     x: 240, y: 50,  text: "",  text_font: f_val,   text_color: 0xE8EDF2}
+        - label: {id: lbl_c2,     x: 158, y: 76,  text: "",  text_font: f_val,   text_color: 0xE8EDF2}
+        - label: {id: lbl_c3,     x: 240, y: 76,  text: "",  text_font: f_val,   text_color: 0xE8EDF2}
+        - label: {id: lbl_action, x: 158, y: 106, text: "",  text_font: f_label, text_color: 0x7A8794}
+        - label: {id: lbl_amount, x: 158, y: 120, text: "",  text_font: f_huge,  text_color: 0xE0A030}
+
+        # ---- hold-to-zero. Deliberately a long press, not a tap: this button
+        # sits where swipes cross, and an accidental tap would overwrite the
+        # stored IMU calibration. LevelUp used hold-to-zero for the same reason.
+        - button:
+            id: btn_zero_ui
+            x: 200
+            y: 158
+            width: 114
+            height: 64
+            radius: 8
+            bg_color: 0x2A323C
+            bg_opa: COVER
+            border_color: 0x7A8794
+            border_width: 1
+            on_long_press:
+              - button.press: btn_zero
+              - lambda: 'lv_label_set_text(id(lbl_zero_txt), "ZEROED");'
+              - delay: 1500ms
+              - lambda: 'lv_label_set_text(id(lbl_zero_txt), "HOLD TO\nZERO");'
+            widgets:
+              - label:
+                  id: lbl_zero_txt
+                  align: CENTER
+                  text: "HOLD TO\nZERO"
+                  text_font: f_label
+                  text_color: 0xE8EDF2
+                  text_align: CENTER
+
+        # ---- footer ----
+        - label: {id: lbl_tilt,  x: 8, y: 182, text: "", text_font: f_tiny, text_color: 0x7A8794}
+        - label: {id: lbl_state, x: 8, y: 202, text: "", text_font: f_tiny, text_color: 0x7A8794}
+
+    # ----------------------------------------------------------------- GNSS --
+    - id: pg_gnss
+      bg_color: 0x101418
+      bg_opa: COVER
+      # Swipe left = forward, swipe right = back. page_wrap defaults true,
+      # so it cycles round at either end.
+      on_swipe_left:
+        - lvgl.page.next:
+            animation: MOVE_LEFT
+            time: 200ms
+      on_swipe_right:
+        - lvgl.page.previous:
+            animation: MOVE_RIGHT
+            time: 200ms
+      widgets:
+        - obj:
+            id: hdr2
+            x: 0
+            y: 0
+            width: 320
+            height: 24
+            radius: 0
+            border_width: 0
+            pad_all: 0
+            bg_color: 0xE05252
+            bg_opa: COVER
+            widgets:
+              - label: {x: 6,  y: 4, text: "GNSS",     text_font: f_head,  text_color: 0x101418}
+              - label: {id: lbl_gfix, x: 78, y: 6, text: "", text_font: f_label, text_color: 0x101418}
+        - label: {x: 8,   y: 32,  text: "LATITUDE",  text_font: f_label, text_color: 0x7A8794}
+        - label: {x: 166, y: 32,  text: "LONGITUDE", text_font: f_label, text_color: 0x7A8794}
+        - label: {id: lbl_lat, x: 8,   y: 48, text: "--", text_font: f_big, text_color: 0xE8EDF2}
+        - label: {id: lbl_lon, x: 166, y: 48, text: "--", text_font: f_big, text_color: 0xE8EDF2}
+        - label: {id: lbl_gnss_a, x: 8, y: 92,  text: "", text_font: f_val,  text_color: 0xE8EDF2}
+        - label: {id: lbl_gnss_b, x: 8, y: 120, text: "", text_font: f_val,  text_color: 0xE8EDF2}
+        - label: {id: lbl_gnss_c, x: 8, y: 152, text: "", text_font: f_tiny, text_color: 0x7A8794}
+        - label: {id: lbl_gnss_d, x: 8, y: 176, text: "", text_font: f_tiny, text_color: 0x7A8794}
+
+    # -------------------------------------------------------------- COMPASS --
+    # Course is GNSS course-over-ground (NMEA RMC field 8), derived from the
+    # velocity solution -- NOT a compass. It is the direction of travel, and is
+    # meaningless below walking pace, so the needle is hidden when stationary
+    # rather than left pointing at a stale or zero heading.
+    - id: pg_compass
+      bg_color: 0x101418
+      bg_opa: COVER
+      on_swipe_left:
+        - lvgl.page.next:
+            animation: MOVE_LEFT
+            time: 200ms
+      on_swipe_right:
+        - lvgl.page.previous:
+            animation: MOVE_RIGHT
+            time: 200ms
+      widgets:
+        - obj:
+            id: hdr3
+            x: 0
+            y: 0
+            width: 320
+            height: 24
+            radius: 0
+            border_width: 0
+            pad_all: 0
+            bg_color: 0x7A8794
+            bg_opa: COVER
+            widgets:
+              - label: {x: 6, y: 4, text: "COURSE", text_font: f_head, text_color: 0x101418}
+              - label: {id: lbl_cmp_hdr, x: 96, y: 6, text: "", text_font: f_label, text_color: 0x101418}
+
+        # ---- dial ----
+        - obj:
+            id: dial
+            x: 12
+            y: 46
+            width: 176
+            height: 176
+            radius: 88
+            pad_all: 0
+            bg_color: 0x1B2128
+            bg_opa: COVER
+            border_color: 0x7A8794
+            border_width: 2
+            widgets:
+              - label: {align: TOP_MID,    y: 6,  text: "N", text_font: f_label, text_color: 0xE05252}
+              - label: {align: BOTTOM_MID, y: -6, text: "S", text_font: f_label, text_color: 0x7A8794}
+              - label: {align: RIGHT_MID,  x: -8, text: "E", text_font: f_label, text_color: 0x7A8794}
+              - label: {align: LEFT_MID,   x: 8,  text: "W", text_font: f_label, text_color: 0x7A8794}
+              - obj:
+                  align: CENTER
+                  width: 120
+                  height: 120
+                  radius: 60
+                  pad_all: 0
+                  bg_opa: TRANSP
+                  border_color: 0x2A323C
+                  border_width: 1
+              - label:
+                  id: lbl_cmp_card
+                  align: CENTER
+                  text: "--"
+                  text_font: f_huge
+                  text_color: 0xE8EDF2
+
+        # ---- needle. Points are rewritten each tick; hidden when stationary. ----
+        - line:
+            id: cmp_needle
+            x: 12
+            y: 46
+            width: 176
+            height: 176
+            line_width: 5
+            line_rounded: true
+            line_color: 0x35C46A
+            points:
+              - {x: 88, y: 88}
+              - {x: 88, y: 22}
+
+        # ---- readouts ----
+        - label: {x: 200, y: 52,  text: "COURSE",  text_font: f_label, text_color: 0x7A8794}
+        - label: {id: lbl_cmp_deg,   x: 200, y: 66,  text: "--",  text_font: f_huge, text_color: 0xE8EDF2}
+        - label: {x: 200, y: 112, text: "SPEED",   text_font: f_label, text_color: 0x7A8794}
+        - label: {id: lbl_cmp_spd,   x: 200, y: 126, text: "--",  text_font: f_val,  text_color: 0xE8EDF2}
+        - label: {id: lbl_cmp_state, x: 200, y: 172, text: "",    text_font: f_tiny, text_color: 0x7A8794}
+        - label: {id: lbl_cmp_note,  x: 200, y: 192, text: "",    text_font: f_tiny, text_color: 0x7A8794}
+
+    # --------------------------------------------------------------- SYSTEM --
+    - id: pg_sys
+      bg_color: 0x101418
+      bg_opa: COVER
+      # Swipe left = forward, swipe right = back. page_wrap defaults true,
+      # so it cycles round at either end.
+      on_swipe_left:
+        - lvgl.page.next:
+            animation: MOVE_LEFT
+            time: 200ms
+      on_swipe_right:
+        - lvgl.page.previous:
+            animation: MOVE_RIGHT
+            time: 200ms
+      widgets:
+        - obj:
+            x: 0
+            y: 0
+            width: 320
+            height: 24
+            radius: 0
+            border_width: 0
+            pad_all: 0
+            bg_color: 0xE8EDF2
+            bg_opa: COVER
+            widgets:
+              - label: {x: 6, y: 4, text: "SYSTEM", text_font: f_head, text_color: 0x101418}
+        - label: {id: lbl_sys_a, x: 8, y: 34,  text: "", text_font: f_tiny, text_color: 0xE8EDF2}
+        - label: {id: lbl_sys_b, x: 8, y: 56,  text: "", text_font: f_tiny, text_color: 0xE8EDF2}
+        - label: {id: lbl_sys_c, x: 8, y: 78,  text: "", text_font: f_tiny, text_color: 0xE8EDF2}
+        - label: {id: lbl_sys_d, x: 8, y: 100, text: "", text_font: f_tiny, text_color: 0xE8EDF2}
+        - label: {id: lbl_sys_e, x: 8, y: 122, text: "", text_font: f_tiny, text_color: 0xE8EDF2}
+        - label: {x: 8, y: 160, text: "GNSS UART  RX G18 / TX G17 @ 38400", text_font: f_tiny, text_color: 0x7A8794}
+        - label: {x: 8, y: 180, text: "I2C  SDA G12 / SCL G11   PORT A  G2 / G1", text_font: f_tiny, text_color: 0x7A8794}
+        - label: {x: 8, y: 200, text: "PORT C CONSUMED BY GNSS MODULE", text_font: f_tiny, text_color: 0x7A8794}
+
+# -----------------------------------------------------------------------------
+#  Touch — tap anywhere to cycle pages
+# -----------------------------------------------------------------------------
+touchscreen:
+  - platform: ft63x6
+    id: touch
+    i2c_id: bsp_bus
+    display: lcd
+    # reset handled in on_boot priority 700 — see the note there
+    # MUST be polled. M5Stack's Tab5 config uses `never` because its GT911 has a
+    # real interrupt_pin driving updates; the CoreS3's touch INT is on AW9523
+    # P1_2, an expander pin that cannot serve as an ESPHome hardware interrupt.
+    # With `never` and no interrupt, nothing ever reads the chip.
+    update_interval: 50ms
+    calibration:
+      x_min: 0
+      x_max: 320
+      y_min: 0
+      y_max: 240
