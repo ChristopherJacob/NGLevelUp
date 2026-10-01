@@ -371,6 +371,21 @@ binary_sensor:
       return tg.location.isValid() && tg.location.age() < 10000;
 
   - platform: template
+    id: ign_power
+    name: "Ignition Power"
+    device_class: plug
+    icon: "mdi:car-battery"
+    # isVbusIn() reads AXP2101 STATUS2 bit 3 together with VBUS-good from
+    # STATUS1 bit 5, so it reports whether the USB rail is actually supplying
+    # power rather than whether a cable is merely plugged in.
+    # The delays matter: cranking browns the rail out for a moment, and a
+    # 10 s delayed_off stops that registering as ignition-off.
+    lambda: 'return id(axp2101_pmu).isVbusIn();'
+    filters:
+      - delayed_on: 2s
+      - delayed_off: 10s
+
+  - platform: template
     id: van_is_level
     name: "Van Is Level"
     icon: "mdi:spirit-level"
