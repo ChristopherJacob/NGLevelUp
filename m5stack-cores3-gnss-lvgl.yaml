@@ -384,6 +384,13 @@ binary_sensor:
     filters:
       - delayed_on: 2s
       - delayed_off: 10s
+    on_release:                      # ignition power lost
+      then:
+        - script.execute: sleep_timer
+    on_press:                        # ignition power restored
+      then:
+        - script.stop: sleep_timer
+        - script.execute: exit_sleep
 
   - platform: template
     id: van_is_level
@@ -754,6 +761,35 @@ script:
           id(esp_logger).set_log_level(LV[i]);
           ESP_LOGI("loglevel", "runtime log level -> %s",
                    id(log_level).current_option().c_str());
+
+  # --- Ignition sleep -------------------------------------------------------
+  # mode: restart means each loss of power restarts the countdown rather than
+  # stacking a second one, and script.stop cancels it if power comes back.
+  - id: sleep_timer
+    mode: restart
+    then:
+      - delay: 10min
+      - script.execute: enter_sleep
+
+  - id: enter_sleep
+    then:
+      - lambda: 'g_asleep = true;'
+      - light.turn_off: led_bar
+      - light.turn_off: lcd_backlight
+      - lvgl.pause:
+          id: lvgl_main
+
+  - id: exit_sleep
+    then:
+      - lambda: |-
+          if (!g_asleep) return;
+          g_asleep = false;
+          g_led_bucket = -2;        // force the LED bar to repaint its colour
+      - lvgl.resume:
+          id: lvgl_main
+      - light.turn_on:
+          id: lcd_backlight
+          brightness: 80%
 
 # -----------------------------------------------------------------------------
 #  Audio — AW88298 amp on the internal I2C bus, speaker on the shared I2S bus.
@@ -1152,6 +1188,7 @@ display:
     invert_colors: true
 
 lvgl:
+  id: lvgl_main
   displays: [lcd]
   buffer_size: 25%          # 320x240x2 = 150 kB full frame; 25% lives in PSRAM
   bg_color: 0x101418
@@ -1453,3 +1490,15 @@ touchscreen:
       x_max: 320
       y_min: 0
       y_max: 240
+    on_release:
+      then:
+        # Only acts while asleep. When awake, page navigation is handled by
+        # LVGL's own on_swipe_* triggers, and LVGL is paused while asleep so
+        # those cannot fire — the two never both respond to one touch.
+        - if:
+            condition:
+              lambda: 'return g_asleep;'
+            then:
+              - script.stop: sleep_timer
+              - script.execute: exit_sleep
+              - script.execute: sleep_timer
