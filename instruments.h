@@ -69,6 +69,29 @@ static inline float inst_alt_needle(float alt_ft, float ft_per_rev)
     return w / (ft_per_rev / 10.0f);
 }
 
+/* Total acceleration magnitude in g. 1.0 at rest, whatever the orientation. */
+static inline float inst_g_magnitude(float ax, float ay, float az)
+{
+    return sqrtf(ax * ax + ay * ay + az * az);
+}
+
+/* Exponentially smoothed rate of change, per minute, from two samples and the
+   previous estimate. tau_s sets how heavily it is damped. A raw derivative of
+   barometric altitude is nearly all sensor noise, so the smoothing is not
+   optional. Returns prev_rate unchanged for a bad dt or a NAN sample, so one
+   dropout cannot poison the estimate. */
+static inline float inst_smooth_rate_per_min(float value, float prev_value,
+                                             float dt_s, float prev_rate,
+                                             float tau_s)
+{
+    float inst, alpha;
+    if (!(dt_s > 0.0f) || !(tau_s > 0.0f)) return prev_rate;
+    if (isnan(value) || isnan(prev_value)) return prev_rate;
+    inst = (value - prev_value) / dt_s * 60.0f;
+    alpha = 1.0f - expf(-dt_s / tau_s);
+    return prev_rate + alpha * (inst - prev_rate);
+}
+
 #ifdef __cplusplus
 }  /* extern "C" */
 #endif

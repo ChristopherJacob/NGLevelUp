@@ -84,6 +84,41 @@ static void test_needle_wrap(void)
     assert(close_to(inst_alt_needle(500.0f, 0.0f), 0.0f, 0.001f));  // guard
 }
 
+static void test_g_magnitude(void)
+{
+    assert(close_to(inst_g_magnitude(0.0f, 0.0f, 1.0f), 1.0f, 0.0001f));
+    assert(close_to(inst_g_magnitude(0.0f, 0.0f, -1.0f), 1.0f, 0.0001f));
+    assert(close_to(inst_g_magnitude(3.0f, 4.0f, 0.0f), 5.0f, 0.0001f));
+    assert(close_to(inst_g_magnitude(0.0f, 0.0f, 0.0f), 0.0f, 0.0001f));
+}
+
+static void test_smoothed_rate(void)
+{
+    // A steady 100 ft per second climb is 6000 ft/min. Starting from a rate
+    // estimate of zero, repeated steps must converge towards it.
+    float rate = 0.0f;
+    float alt = 0.0f;
+    for (int i = 0; i < 400; i++) {
+        float next = alt + 10.0f;          // 10 ft per 0.1 s step
+        rate = inst_smooth_rate_per_min(next, alt, 0.1f, rate, 2.0f);
+        alt = next;
+    }
+    assert(close_to(rate, 6000.0f, 60.0f));
+
+    // No movement must decay towards zero, not hold the old rate.
+    for (int i = 0; i < 400; i++) {
+        rate = inst_smooth_rate_per_min(alt, alt, 0.1f, rate, 2.0f);
+    }
+    assert(close_to(rate, 0.0f, 10.0f));
+
+    // Guards: a non-positive dt must leave the estimate untouched.
+    assert(close_to(inst_smooth_rate_per_min(10.0f, 0.0f, 0.0f, 123.0f, 2.0f),
+                    123.0f, 0.0001f));
+    // A NAN sample must not poison the estimate.
+    assert(close_to(inst_smooth_rate_per_min(NAN, 0.0f, 0.1f, 123.0f, 2.0f),
+                    123.0f, 0.0001f));
+}
+
 int main(void)
 {
     test_altitude_zero_when_pressure_equals_setting();
@@ -94,6 +129,8 @@ int main(void)
     test_pressure_unit_conversions();
     test_speed_and_length_conversions();
     test_needle_wrap();
+    test_g_magnitude();
+    test_smoothed_rate();
     printf("ALL TESTS PASSED\n");
     return 0;
 }

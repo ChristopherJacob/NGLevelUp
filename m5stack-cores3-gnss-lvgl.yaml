@@ -1232,6 +1232,29 @@ interval:
                               fabsf(lat_g) < 0.03f ? "centred" : "");
           }
 
+          // ---- RATES page ----
+          {
+            uint32_t now_ms = esphome::millis();
+            if (!std::isnan(g_alt_ft)) {
+              if (g_vsi_prev_ms != 0) {
+                float dt = (now_ms - g_vsi_prev_ms) / 1000.0f;
+                g_vsi_fpm = inst_smooth_rate_per_min(g_alt_ft, g_vsi_prev_ft,
+                                                     dt, g_vsi_fpm, 4.0f);
+              }
+              g_vsi_prev_ft = g_alt_ft;
+              g_vsi_prev_ms = now_ms;
+            }
+            snprintf(b, sizeof(b), "%+.0f fpm", g_vsi_fpm);
+            lv_label_set_text(id(lbl_vsi), b);
+
+            float gm = inst_g_magnitude(
+                id(acc_x).has_state() ? id(acc_x).state : 0.0f,
+                id(acc_y).has_state() ? id(acc_y).state : 0.0f,
+                id(acc_z).has_state() ? id(acc_z).state : 0.0f);
+            snprintf(b, sizeof(b), "%.2f g", gm);
+            lv_label_set_text(id(lbl_g), b);
+          }
+
           // ---- SYSTEM page ----
           snprintf(b, sizeof(b), "SSID   %s",
                    id(wifi_ssid).state.empty() ? "--" : id(wifi_ssid).state.c_str());
@@ -1258,6 +1281,23 @@ interval:
       - lvgl.indicator.update:
           id: alt_needle_1000
           value: !lambda 'return std::isnan(g_alt_ft) ? 0.0f : inst_alt_needle(g_alt_ft, 10000.0f);'
+      - lvgl.indicator.update:
+          id: vsi_needle
+          value: !lambda |-
+            float v = g_vsi_fpm / 100.0f;
+            if (v >  20.0f) v =  20.0f;
+            if (v < -20.0f) v = -20.0f;
+            return v;
+      - lvgl.indicator.update:
+          id: g_needle
+          value: !lambda |-
+            float g = inst_g_magnitude(
+                id(acc_x).has_state() ? id(acc_x).state : 0.0f,
+                id(acc_y).has_state() ? id(acc_y).state : 0.0f,
+                id(acc_z).has_state() ? id(acc_z).state : 0.0f) * 10.0f;
+            if (g > 30.0f) g = 30.0f;
+            if (g < 0.0f)  g = 0.0f;
+            return g;
 
 # Fonts — LVGL references these by id via `text_font:`.
 font:
@@ -1815,6 +1855,112 @@ lvgl:
         - label: {x: 212, y: 128, text: "LATERAL", text_font: f_label, text_color: 0x7A8794}
         - label: {id: lbl_att_lat,   x: 212, y: 142, text: "--", text_font: f_val, text_color: 0xE8EDF2}
         - label: {id: lbl_att_note,  x: 212, y: 196, text: "", text_font: f_tiny, text_color: 0x7A8794}
+
+    # ------------------------------------------------------------------ RATES --
+    - id: pg_rates
+      bg_color: 0x101418
+      bg_opa: COVER
+      on_swipe_left:
+        - lvgl.page.next:
+            animation: MOVE_LEFT
+            time: 200ms
+      on_swipe_right:
+        - lvgl.page.previous:
+            animation: MOVE_RIGHT
+            time: 200ms
+      widgets:
+        - obj:
+            x: 0
+            y: 0
+            width: 320
+            height: 24
+            radius: 0
+            border_width: 0
+            pad_all: 0
+            bg_color: 0x7A8794
+            bg_opa: COVER
+            widgets:
+              - label: {x: 6, y: 4, text: "RATES", text_font: f_head, text_color: 0x101418}
+
+        # ---- VSI: +/- 2000 ft/min, zero at the 9 o'clock position ----
+        - meter:
+            id: vsi_meter
+            x: 8
+            y: 32
+            width: 150
+            height: 150
+            radius: 75
+            pad_all: 0
+            bg_color: 0x1B2128
+            bg_opa: COVER
+            border_color: 0x7A8794
+            border_width: 2
+            scales:
+              - id: vsi_scale
+                range_from: -20
+                range_to: 20
+                angle_range: 320
+                rotation: 110
+                ticks:
+                  count: 41
+                  width: 1
+                  length: 5
+                  color: 0x7A8794
+                  major:
+                    stride: 5
+                    width: 3
+                    length: 10
+                    color: 0xE8EDF2
+                    label_gap: 6
+                indicators:
+                  - line:
+                      id: vsi_needle
+                      width: 4
+                      color: 0x35C46A
+                      length: 60
+                      value: 0
+        - label: {x: 8,  y: 186, text: "VERT SPEED  x100 ft/min", text_font: f_tiny, text_color: 0x7A8794}
+        - label: {id: lbl_vsi, x: 8, y: 204, text: "--", text_font: f_val, text_color: 0xE8EDF2}
+
+        # ---- G-meter: 0 to 3 g ----
+        - meter:
+            id: g_meter
+            x: 166
+            y: 32
+            width: 150
+            height: 150
+            radius: 75
+            pad_all: 0
+            bg_color: 0x1B2128
+            bg_opa: COVER
+            border_color: 0x7A8794
+            border_width: 2
+            scales:
+              - id: g_scale
+                range_from: 0
+                range_to: 30
+                angle_range: 270
+                rotation: 135
+                ticks:
+                  count: 31
+                  width: 1
+                  length: 5
+                  color: 0x7A8794
+                  major:
+                    stride: 5
+                    width: 3
+                    length: 10
+                    color: 0xE8EDF2
+                    label_gap: 6
+                indicators:
+                  - line:
+                      id: g_needle
+                      width: 4
+                      color: 0xE0A030
+                      length: 60
+                      value: 10
+        - label: {x: 166, y: 186, text: "G  x0.1", text_font: f_tiny, text_color: 0x7A8794}
+        - label: {id: lbl_g, x: 166, y: 204, text: "--", text_font: f_val, text_color: 0xE8EDF2}
 
     # --------------------------------------------------------------- SYSTEM --
     - id: pg_sys
