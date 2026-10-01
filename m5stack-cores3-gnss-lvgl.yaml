@@ -1066,6 +1066,13 @@ interval:
     id: lvgl_tick
     then:
       - lambda: |-
+          // Nothing to draw while asleep. lvgl.pause already stops rendering,
+          // so these writes would only mark objects dirty — but while the
+          // ignition is off the device is on its own battery, and this is
+          // ~90 formatting ops 4x a second for as long as the van is parked.
+          // set_paused(false) invalidates the whole screen on wake, so the
+          // at-most-250ms staleness this leaves behind is never visible.
+          if (g_asleep) return;
           char b[64];
           const auto &g = g_lvl;
           bool ok  = g.guidance_available;
