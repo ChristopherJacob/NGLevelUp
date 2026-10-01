@@ -40,6 +40,7 @@ esphome:
   min_version: 2026.1.0
   includes:
     - leveling.h              # vendored from LevelUp — see file header
+    - instruments.h           # pure maths for the instrument pages
   on_boot:
     # FT6336 needs ~300 ms after reset release before it answers on I2C.
     # ESPHome's ft63x6 hard_reset_() releases reset and reads the chip ID with no
@@ -281,6 +282,14 @@ switch:
       - light.turn_off: led_bar
       - lambda: 'g_led_bucket = -2;'
 
+  - platform: template       # display speed in mph instead of km/h
+    id: speed_mph            # affects the on-screen readouts only; the HA
+    name: "Speed in mph"     # `Speed` sensor keeps its km/h unit and history
+    icon: "mdi:speedometer"
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    entity_category: config
+
   - platform: template       # silence the leveling beeper
     id: beep_mute            # ON = muted. Defaults to muted on a device with no
     name: "Beeper Muted"     # stored state; otherwise the last choice is restored.
@@ -475,6 +484,17 @@ sensor:
     accuracy_decimals: 2
     update_interval: 10s
     lambda: 'return g_lvl.guidance_available ? g_lvl.front_high_deg : NAN;'
+
+  - platform: template
+    id: gps_speed_mph
+    name: "Speed (mph)"
+    unit_of_measurement: mph
+    accuracy_decimals: 1
+    update_interval: 10s
+    lambda: |-
+      auto &tg = id(gnss).get_tiny_gps();
+      if (!tg.speed.isValid()) return NAN;
+      return inst_kmh_to_mph((float) tg.speed.kmph());
 
   # Tilt as a height difference across each axis — LevelUp's roll_in / pitch_in.
   # tan(angle) * the span the angle acts over. This is the total difference
@@ -969,11 +989,15 @@ interval:
                    (unsigned) tg.satellites.value(),
                    tg.hdop.isValid() ? tg.hdop.hdop() : 99.99);
           lv_label_set_text(id(lbl_gnss_a), b);
-          snprintf(b, sizeof(b), "ALT %.0fm  SPD %.1f  COG %s",
-                   tg.altitude.isValid() ? tg.altitude.meters() : 0.0,
-                   tg.speed.isValid() ? tg.speed.kmph() : 0.0,
-                   cog_txt);
-          lv_label_set_text(id(lbl_gnss_b), b);
+          {
+            float kmh = tg.speed.isValid() ? (float) tg.speed.kmph() : 0.0f;
+            bool imp = id(speed_mph).state;
+            snprintf(b, sizeof(b), "ALT %.0fm  SPD %.1f %s  COG %s",
+                     tg.altitude.isValid() ? tg.altitude.meters() : 0.0,
+                     imp ? inst_kmh_to_mph(kmh) : kmh, imp ? "mph" : "km/h",
+                     cog_txt);
+            lv_label_set_text(id(lbl_gnss_b), b);
+          }
           if (tg.time.isValid()) {
             snprintf(b, sizeof(b), "UTC %02d:%02d:%02d   fix age %.1fs",
                      tg.time.hour(), tg.time.minute(), tg.time.second(),
@@ -996,9 +1020,13 @@ interval:
           } else {
             lv_label_set_text(id(lbl_cmp_deg), "--");
           }
-          snprintf(b, sizeof(b), "%.1f km/h",
-                   tg.speed.isValid() ? tg.speed.kmph() : 0.0);
-          lv_label_set_text(id(lbl_cmp_spd), b);
+          {
+            float kmh = tg.speed.isValid() ? (float) tg.speed.kmph() : 0.0f;
+            bool imp = id(speed_mph).state;
+            snprintf(b, sizeof(b), "%.1f %s",
+                     imp ? inst_kmh_to_mph(kmh) : kmh, imp ? "mph" : "km/h");
+            lv_label_set_text(id(lbl_cmp_spd), b);
+          }
           lv_label_set_text(id(lbl_cmp_state),
               g_is_moving ? "MOVING" : "STATIONARY");
           lv_label_set_text(id(lbl_cmp_note),
