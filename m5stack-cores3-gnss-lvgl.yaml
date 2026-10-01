@@ -671,6 +671,19 @@ number:
     entity_category: config
     on_value:
       - lambda: 'id(beeper).set_gain(x / 100.0f);'
+  - platform: template
+    id: qnh_inhg
+    name: "Altimeter Setting"
+    icon: "mdi:gauge"
+    unit_of_measurement: inHg
+    min_value: 28.00
+    max_value: 31.50
+    step: 0.01
+    initial_value: 29.92        # ISA standard, 1013.25 hPa
+    restore_value: true
+    optimistic: true
+    mode: box
+    entity_category: config
 
 select:
   - platform: template
@@ -744,6 +757,34 @@ button:
       - motion.clear_calibration:
           id: imu
           save: true
+  - platform: template
+    id: btn_qnh_from_gps
+    name: "Set Altimeter From GPS"
+    icon: "mdi:crosshairs-gps"
+    entity_category: config
+    on_press:
+      then:
+        - lambda: |-
+            auto &tg = id(gnss).get_tiny_gps();
+            if (!tg.altitude.isValid() || !id(baro_press).has_state()) {
+              ESP_LOGW("alt", "no GNSS altitude or pressure yet");
+              return;
+            }
+            float gps_ft = inst_m_to_ft((float) tg.altitude.meters());
+            float q_hpa = inst_alt_to_qnh_hpa(id(baro_press).state, gps_ft);
+            if (std::isnan(q_hpa)) {
+              ESP_LOGW("alt", "could not derive setting");
+              return;
+            }
+            float inhg = inst_hpa_to_inhg(q_hpa);
+            if (inhg < 28.0f || inhg > 31.5f) {
+              ESP_LOGW("alt", "derived setting %.2f inHg out of range", inhg);
+              return;
+            }
+            auto call = id(qnh_inhg).make_call();
+            call.set_value(inhg);
+            call.perform();
+            ESP_LOGI("alt", "setting -> %.2f inHg from GPS %.0f ft", inhg, gps_ft);
 
 # -----------------------------------------------------------------------------
 #  Runtime log level. The select only persists the *choice*; the logger itself
@@ -1109,6 +1150,39 @@ interval:
             }
           }
 
+          // ---- ALTIMETER page ----
+          {
+            float qnh_hpa = inst_inhg_to_hpa(id(qnh_inhg).state);
+            if (id(baro_press).has_state()) {
+              g_alt_ft = inst_press_to_alt_ft(id(baro_press).state, qnh_hpa);
+            }
+            if (!std::isnan(g_alt_ft)) {
+              snprintf(b, sizeof(b), "%.0f ft", g_alt_ft);
+              lv_label_set_text(id(lbl_alt_ft), b);
+            } else {
+              lv_label_set_text(id(lbl_alt_ft), "--");
+            }
+            snprintf(b, sizeof(b), "%.2f inHg", id(qnh_inhg).state);
+            lv_label_set_text(id(lbl_alt_qnh), b);
+
+            if (tg.altitude.isValid()) {
+              snprintf(b, sizeof(b), "%.0f ft",
+                       inst_m_to_ft((float) tg.altitude.meters()));
+              lv_label_set_text(id(lbl_alt_gps), b);
+            } else {
+              lv_label_set_text(id(lbl_alt_gps), "--");
+            }
+
+            if (id(baro_press).has_state()) {
+              snprintf(b, sizeof(b), "station %.1f hPa", id(baro_press).state);
+              lv_label_set_text(id(lbl_alt_hpa), b);
+            }
+            lv_label_set_text(id(lbl_alt_src), "BAROMETRIC");
+            lv_label_set_text(id(lbl_alt_note),
+                              tg.altitude.isValid() ? "GPS available to set from"
+                                                    : "no GPS altitude");
+          }
+
           // ---- SYSTEM page ----
           snprintf(b, sizeof(b), "SSID   %s",
                    id(wifi_ssid).state.empty() ? "--" : id(wifi_ssid).state.c_str());
@@ -1129,6 +1203,12 @@ interval:
                    id(batt_level).state, id(batt_voltage).state,
                    id(batt_charging).state ? "  charging" : "");
           lv_label_set_text(id(lbl_sys_e), b);
+      - lvgl.indicator.update:
+          id: alt_needle_100
+          value: !lambda 'return std::isnan(g_alt_ft) ? 0.0f : inst_alt_needle(g_alt_ft, 1000.0f);'
+      - lvgl.indicator.update:
+          id: alt_needle_1000
+          value: !lambda 'return std::isnan(g_alt_ft) ? 0.0f : inst_alt_needle(g_alt_ft, 10000.0f);'
 
 # Fonts — LVGL references these by id via `text_font:`.
 font:
@@ -1434,6 +1514,93 @@ lvgl:
         - label: {id: lbl_cmp_spd,   x: 200, y: 126, text: "--",  text_font: f_val,  text_color: 0xE8EDF2}
         - label: {id: lbl_cmp_state, x: 200, y: 172, text: "",    text_font: f_tiny, text_color: 0x7A8794}
         - label: {id: lbl_cmp_note,  x: 200, y: 192, text: "",    text_font: f_tiny, text_color: 0x7A8794}
+
+    # ------------------------------------------------------------- ALTIMETER --
+    # Barometric, like the real instrument: pressure from the BMP280 plus a
+    # settable datum. GNSS altitude is shown alongside to set it against, not
+    # as the gauge source — a barometric needle moves smoothly and immediately,
+    # where GNSS altitude is noisy and the least accurate axis of a fix.
+    - id: pg_alt
+      bg_color: 0x101418
+      bg_opa: COVER
+      on_swipe_left:
+        - lvgl.page.next:
+            animation: MOVE_LEFT
+            time: 200ms
+      on_swipe_right:
+        - lvgl.page.previous:
+            animation: MOVE_RIGHT
+            time: 200ms
+      widgets:
+        - obj:
+            x: 0
+            y: 0
+            width: 320
+            height: 24
+            radius: 0
+            border_width: 0
+            pad_all: 0
+            bg_color: 0x7A8794
+            bg_opa: COVER
+            widgets:
+              - label: {x: 6, y: 4, text: "ALTIMETER", text_font: f_head, text_color: 0x101418}
+              - label: {id: lbl_alt_src, x: 110, y: 6, text: "", text_font: f_label, text_color: 0x101418}
+
+        - meter:
+            id: alt_meter
+            x: 10
+            y: 36
+            width: 188
+            height: 188
+            radius: 94
+            pad_all: 0
+            bg_color: 0x1B2128
+            bg_opa: COVER
+            border_color: 0x7A8794
+            border_width: 2
+            scales:
+              - id: alt_scale
+                range_from: 0
+                range_to: 10
+                angle_range: 360
+                rotation: 270          # 0 at the top, like the real dial
+                ticks:
+                  count: 51            # a tick every 20 ft
+                  width: 1
+                  length: 6
+                  color: 0x7A8794
+                  major:
+                    stride: 5          # labelled every 100 ft
+                    width: 3
+                    length: 12
+                    color: 0xE8EDF2
+                    label_gap: 8
+                indicators:
+                  # Thousands pointer: short and fat, drawn first so the
+                  # hundreds pointer sits on top of it.
+                  - line:
+                      id: alt_needle_1000
+                      width: 7
+                      color: 0x35C46A
+                      length: 48
+                      value: 0
+                  # Hundreds pointer: long and thin.
+                  - line:
+                      id: alt_needle_100
+                      width: 4
+                      color: 0xE8EDF2
+                      length: 80
+                      value: 0
+
+        # ---- Kollsman window and readouts ----
+        - label: {x: 208, y: 40,  text: "ALTITUDE",  text_font: f_label, text_color: 0x7A8794}
+        - label: {id: lbl_alt_ft,   x: 208, y: 54,  text: "--",  text_font: f_huge, text_color: 0xE8EDF2}
+        - label: {x: 208, y: 94,  text: "SETTING",   text_font: f_label, text_color: 0x7A8794}
+        - label: {id: lbl_alt_qnh,  x: 208, y: 108, text: "--",  text_font: f_val,  text_color: 0x35C46A}
+        - label: {x: 208, y: 140, text: "GPS ALT",   text_font: f_label, text_color: 0x7A8794}
+        - label: {id: lbl_alt_gps,  x: 208, y: 154, text: "--",  text_font: f_val,  text_color: 0xE8EDF2}
+        - label: {id: lbl_alt_hpa,  x: 208, y: 186, text: "",    text_font: f_tiny, text_color: 0x7A8794}
+        - label: {id: lbl_alt_note, x: 208, y: 204, text: "",    text_font: f_tiny, text_color: 0x7A8794}
 
     # --------------------------------------------------------------- SYSTEM --
     - id: pg_sys

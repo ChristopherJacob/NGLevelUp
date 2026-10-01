@@ -264,4 +264,5 @@ inline uint32_t g_last_beep_ms  = 0;
 inline int      g_move_count    = 0;     // GNSS motion hysteresis counter
 inline int      g_led_bucket    = -2;    // last colour bucket pushed to the LED bar
 inline bool     g_asleep        = false; // screen/LEDs off, LVGL paused
+inline float    g_alt_ft        = NAN;   // barometric altitude, feet
 #endif
