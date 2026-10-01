@@ -217,21 +217,27 @@ light:
   # stack sitting ~10 C hotter and cycling the battery while plugged in. Removing
   # this component brings all of that back.
   #
-  # Addressing the LEDs was abandoned 2026-08-26 after trying G5/G10/G7/G6, both
-  # SK6812 and WS2812 timings, and 3- and 4-byte framing. The strip accepts
-  # commands and reports state; nothing ever lights. Kept internal so it does not
-  # surface in Home Assistant as a light that does nothing. If the other base
-  # turns out to behave differently, this is the place to start.
+  # CONFIRMED WORKING 2026-09-30: GPIO5 (M-Bus pin 8), chipset WS2812, GRB.
+  #
+  # The chipset was the thing. The previous base's bar never lit on any
+  # combination tried (G5/G10/G7/G6, SK6812 and WS2812 timings, 3- and 4-byte
+  # framing) -- including this exact G5+WS2812+GRB pairing. The newer base
+  # responds to it immediately, so either the LED part differs (Bottom2 ships
+  # SK6812, Bottom3 WS2812) or the old bar was faulty. Either way: do not
+  # "correct" this to SK6812.
+  #
+  # Secondary but still true: this component also claims GPIO5 and holds it low.
+  # Undriven that line floats, latches the LEDs at full white and burns
+  # ~600 mA / 3 W. Keep the component even if the indicator is switched off.
   - platform: esp32_rmt_led_strip
     id: led_bar
-    internal: true
-    pin: GPIO5            # M-Bus pin 8
+    name: "LED Bar"
+    pin: GPIO5             # M-Bus pin 8
     num_leds: 10
-    chipset: SK6812
-    channel_colors: GRBW   # 4 bytes/LED — SK6812-RGBW order
+    chipset: WS2812        # 3 bytes/LED, GRB — NOT SK6812
+    channel_colors: GRB
     default_transition_length: 0s
     restore_mode: ALWAYS_OFF
-
 
 switch:
   - platform: gpio         # 5V boost converter
@@ -263,6 +269,17 @@ switch:
       number: 0
     internal: true
     restore_mode: ALWAYS_ON
+
+  - platform: template       # drive the LED bar from levelling state
+    id: led_level_mode       # off = the bar is yours to control manually
+    name: "LED Bar Shows Level"
+    icon: "mdi:led-strip-variant"
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF
+    entity_category: config
+    on_turn_off:
+      - light.turn_off: led_bar
+      - lambda: 'g_led_bucket = -2;'
 
   - platform: template       # silence the leveling beeper
     id: beep_mute            # ON = muted. Defaults to muted on a device with no
@@ -458,6 +475,30 @@ sensor:
     accuracy_decimals: 2
     update_interval: 10s
     lambda: 'return g_lvl.guidance_available ? g_lvl.front_high_deg : NAN;'
+
+  # Tilt as a height difference across each axis — LevelUp's roll_in / pitch_in.
+  # tan(angle) * the span the angle acts over. This is the total difference
+  # between the two sides, not a per-corner lift.
+  - platform: template
+    id: van_tilt_side_in
+    name: "Roll (in)"
+    unit_of_measurement: in
+    accuracy_decimals: 1
+    update_interval: 10s
+    lambda: |-
+      if (!g_lvl.guidance_available) return NAN;
+      float v = tanf(g_lvl.left_high_deg * LEVELING_DEG2RAD) * id(van_trackwidth).state;
+      return (fabsf(v) < 0.02f) ? 0.0f : v;
+  - platform: template
+    id: van_tilt_end_in
+    name: "Pitch (in)"
+    unit_of_measurement: in
+    accuracy_decimals: 1
+    update_interval: 10s
+    lambda: |-
+      if (!g_lvl.guidance_available) return NAN;
+      float v = tanf(g_lvl.front_high_deg * LEVELING_DEG2RAD) * id(van_wheelbase).state;
+      return (fabsf(v) < 0.02f) ? 0.0f : v;
 
   # Leveling guidance for Home Assistant.
   - platform: template
@@ -765,6 +806,32 @@ interval:
                                      id(van_trackwidth).state,
                                      id(van_wheelbase).state,
                                      m, o);
+
+          // --- LED bar as a level indicator ---
+          // Visible from the driver's seat and from outside while someone spots
+          // you onto blocks, which a 320x240 screen is not. Only written when
+          // the colour bucket changes, so the RMT peripheral is not hammered at
+          // 10 Hz. 35% brightness: 10 LEDs at full output is ~600 mA.
+          if (id(led_level_mode).state) {
+            int bucket;
+            float err = fmaxf(fabsf(g_lvl.left_high_deg), fabsf(g_lvl.front_high_deg));
+            if (!g_lvl.guidance_available) bucket = 0;   // blue  — dimensions unset
+            else if (g_lvl.is_level)       bucket = 1;   // green — level
+            else if (err < 1.5f)           bucket = 2;   // yellow
+            else if (err < 4.0f)           bucket = 3;   // orange
+            else                           bucket = 4;   // red
+            if (bucket != g_led_bucket) {
+              g_led_bucket = bucket;
+              static const float R[5] = {0.0f, 0.0f, 0.6f, 1.0f, 1.0f};
+              static const float G[5] = {0.0f, 1.0f, 1.0f, 0.5f, 0.0f};
+              static const float B[5] = {1.0f, 0.2f, 0.0f, 0.0f, 0.0f};
+              auto call = id(led_bar).turn_on();
+              call.set_rgb(R[bucket], G[bucket], B[bucket]);
+              call.set_brightness(0.35f);
+              call.set_transition_length(0);
+              call.perform();
+            }
+          }
 
           // --- adaptive beeper ---
           if (id(beep_mute).state || !g_lvl.guidance_available) return;

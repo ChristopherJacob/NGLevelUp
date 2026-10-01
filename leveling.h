@@ -262,4 +262,5 @@ inline bool     g_pitch_latched = false;
 inline bool     g_is_moving     = false; // from GNSS ground speed
 inline uint32_t g_last_beep_ms  = 0;
 inline int      g_move_count    = 0;     // GNSS motion hysteresis counter
+inline int      g_led_bucket    = -2;    // last colour bucket pushed to the LED bar
 #endif

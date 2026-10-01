@@ -1,0 +1,982 @@
+# =============================================================================
+#  M5Stack CoreS3 SE + Module GNSS  —  ESPHome
+# =============================================================================
+#  Derived from M5Stack-CoreS3-SE-GNSS-Reference.md (2026-08-25).
+#
+#  Hardware wiring this file assumes (all [measured] in the reference doc):
+#    Internal I2C  SDA=GPIO12  SCL=GPIO11   -> AXP2101 0x34, AW9523 0x58,
+#                                              FT6336 0x38, BM8563 0x51,
+#                                              BMI270 0x69, BMP280 0x76
+#    Port A  I2C   SDA=GPIO2   SCL=GPIO1    -> empty, yours to use
+#    GNSS UART     RX=GPIO18  TX=GPIO17  38400 8N1   (DIP: RXD4 ON, TXD4 ON)
+#    LCD (ILI9342) SCLK=GPIO36 MOSI=GPIO37 DC=GPIO35 CS=GPIO3
+#                  reset via AW9523 P1_1 (pin 9), backlight via AXP2101 DLDO1
+#
+#  NOTE: Port C (G17/G18) is consumed by the GNSS module. Do not reuse.
+#  NOTE: flashing this REPLACES the factory app. Keep your head64k.bin/full.bin
+#        backup — ESPHome installs its own partition table.
+#
+#  Requires ESPHome 2026.1+ (mipi_spi display, bmi270/motion, bm8563).
+#  Create a secrets.yaml with: wifi_ssid, wifi_password, ap_password
+#
+#  Leveling math is vendored from LevelUp as ./leveling.h — keep the two files
+#  together. It is header-only and still passes LevelUp's own
+#  test/leveling/test_leveling.c unchanged (as C99 and as C++).
+# =============================================================================
+
+substitutions:
+  name: cores3-gnss
+  friendly_name: CoreS3 GNSS
+
+esphome:
+  name: ${name}
+  friendly_name: ${friendly_name}
+  min_version: 2026.1.0
+  includes:
+    - leveling.h              # vendored from LevelUp — see file header
+  on_boot:
+    # FT6336 needs ~300 ms after reset release before it answers on I2C.
+    # ESPHome's ft63x6 hard_reset_() releases reset and reads the chip ID with no
+    # delay in between, so it reads 0 and logs "touch driver failed to start"
+    # (without marking the component failed, so the follow-up config writes are
+    # silently lost too). Do the reset here instead and drop reset_pin from the
+    # touchscreen. Priority 700 lands after aw9523b (IO, 900) and the gpio switch
+    # (HARDWARE, 800) but before the touchscreen (DATA, 600).
+    # NB: this must be a lambda. The `delay:` action yields and lets setup carry
+    # on; vTaskDelay here actually blocks, which is the whole point.
+    - priority: 700
+      then:
+        - lambda: |-
+            id(touch_rst).turn_off();            // assert TOUCH_RST (active low)
+            vTaskDelay(pdMS_TO_TICKS(20));
+            id(touch_rst).turn_on();             // release
+            vTaskDelay(pdMS_TO_TICKS(300));      // FT6336 power-on time
+    - priority: 600
+      then:
+        - light.turn_on:
+            id: lcd_backlight
+            brightness: 80%
+
+esp32:
+  variant: esp32s3
+  flash_size: 16MB          # [measured] XMC 16 MB quad-SPI
+  cpu_frequency: 240MHz
+  framework:
+    type: esp-idf
+    sdkconfig_options:
+      CONFIG_ESP32S3_DATA_CACHE_64KB: "y"
+      CONFIG_ESP32S3_DATA_CACHE_LINE_64B: "y"
+      CONFIG_ESP32S3_INSTRUCTION_CACHE_32KB: "y"
+
+psram:
+  mode: quad                # CoreS3 uses quad PSRAM; octal would eat GPIO33-37
+  speed: 80MHz
+
+logger:
+  level: INFO
+  # UART0 console is GPIO43/44; leave hardware_uart default so it does not
+  # fight the GNSS UART on GPIO17/18.
+
+api:
+  encryption:
+    key: !secret cores3_gnss__encryption_key
+ota:
+  - platform: esphome
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  ap:
+    ssid: "${friendly_name} Fallback"
+    password: !secret ap_password
+
+captive_portal:
+
+# Device's own web UI at http://<ip>/ — the fallback for configuring the van
+# dimensions, zeroing and muting when Home Assistant is not reachable.
+# `local: true` embeds the JS/CSS in the firmware; without it the page pulls its
+# assets from an external CDN and is dead whenever the van has no internet.
+web_server:
+  port: 80
+  local: true
+  include_internal: true
+
+# -----------------------------------------------------------------------------
+#  M5Stack board-support components (PMIC + IO expander are not in core ESPHome)
+# -----------------------------------------------------------------------------
+external_components:
+  - source: github://m5stack/esphome-yaml/components
+    components: [axp2101, aw9523b, aw88298]
+    refresh: 1d
+
+# -----------------------------------------------------------------------------
+#  Buses
+# -----------------------------------------------------------------------------
+i2c:
+  - id: bsp_bus            # internal bus: PMIC, expander, touch, RTC, IMU, baro
+    sda: GPIO12
+    scl: GPIO11
+    frequency: 400kHz
+  - id: ext_bus            # Port A (Grove) — free for your own sensors
+    sda: GPIO2
+    scl: GPIO1
+    scan: true
+
+spi:
+  - id: spi_bus            # shared LCD / microSD bus
+    clk_pin: GPIO36
+    mosi_pin: GPIO37
+
+uart:
+  - id: gnss_uart
+    rx_pin: GPIO18         # module TX  (DIP RXD switch 4 -> mbus15)
+    tx_pin: GPIO17         # module RX  (DIP TXD switch 4 -> mbus16)
+    baud_rate: 38400       # NEO-M9N default
+    rx_buffer_size: 2048   # ~12 NMEA sentences/sec
+
+# -----------------------------------------------------------------------------
+#  Power management / IO expander
+# -----------------------------------------------------------------------------
+axp2101:
+  id: axp2101_pmu
+  i2c_id: bsp_bus
+
+aw9523b:
+  id: aw9523b_hub
+  i2c_id: bsp_bus
+  p0_drive_mode: PUSH_PULL
+
+output:
+  - platform: axp2101      # LCD backlight rail
+    type: range
+    channel: DLDO1
+    id: lcd_backlight_output
+    min_voltage: 2600
+    max_voltage: 3300
+  - platform: axp2101
+    channel: ALDO1
+    voltage: 1800
+  - platform: axp2101
+    channel: ALDO2
+    voltage: 3300
+  - platform: axp2101
+    channel: BLDO1
+    voltage: 2800
+  - platform: axp2101
+    channel: BLDO2
+    voltage: 1500
+
+light:
+  - platform: monochromatic
+    id: lcd_backlight
+    name: "LCD Backlight"
+    icon: "mdi:television"
+    entity_category: config
+    output: lcd_backlight_output
+    restore_mode: RESTORE_DEFAULT_ON
+    default_transition_length: 250ms
+
+switch:
+  - platform: gpio         # 5V boost converter
+    id: boost_en
+    pin:
+      aw9523b_id: aw9523b_hub
+      number: 15
+    internal: true
+    restore_mode: ALWAYS_ON
+  - platform: gpio         # M-Bus power out — equivalent to M5.Power.setExtOutput(true)
+    id: bus_out_en         # the GNSS module is powered from the bus, so keep this ON
+    pin:
+      aw9523b_id: aw9523b_hub
+      number: 1
+    internal: true
+    restore_mode: ALWAYS_ON
+  - platform: gpio         # AW9523 peripheral reset line, must stay released
+    id: aw_rst
+    pin:
+      aw9523b_id: aw9523b_hub
+      number: 2
+    internal: true
+    restore_mode: ALWAYS_ON
+
+  - platform: gpio         # P0_0 = TOUCH_RST, released by the on_boot handler
+    id: touch_rst           # above; see the comment there for why not reset_pin
+    pin:
+      aw9523b_id: aw9523b_hub
+      number: 0
+    internal: true
+    restore_mode: ALWAYS_ON
+
+  - platform: template       # silence the leveling beeper
+    id: beep_mute
+    name: "Beeper Muted"
+    icon: "mdi:volume-off"
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF
+    entity_category: config
+
+# -----------------------------------------------------------------------------
+#  GNSS — u-blox NEO-M9N, NMEA 0183
+# -----------------------------------------------------------------------------
+gps:
+  - id: gnss
+    uart_id: gnss_uart
+    update_interval: 5s
+    latitude:
+      id: gps_lat
+      name: "Latitude"
+    longitude:
+      id: gps_lon
+      name: "Longitude"
+    altitude:
+      id: gps_alt
+      name: "Altitude"
+    speed:
+      id: gps_speed
+      name: "Speed"
+    course:
+      id: gps_course
+      name: "Course"
+    satellites:
+      id: gps_sats
+      name: "Satellites"
+    hdop:
+      id: gps_hdop
+      name: "HDOP"
+
+time:
+  - platform: gps          # UTC from the NEO-M9N once it has a fix
+    id: gps_time
+    gps_id: gnss
+    on_time_sync:
+      then:
+        - bm8563.write_time:   # push GNSS time into the BM8563 RTC
+            id: rtc_time
+  - platform: bm8563        # survives power loss, seeds the clock before fix
+    id: rtc_time
+    i2c_id: bsp_bus
+    address: 0x51
+    update_interval: never
+
+# -----------------------------------------------------------------------------
+#  Module GNSS on-board sensors
+# -----------------------------------------------------------------------------
+motion:
+  - platform: bmi270
+    id: imu
+    i2c_id: bsp_bus
+    address: 0x69          # [measured] on-module slide switch position; 0x68 is the alternative
+    accelerometer_range: 4G
+    gyroscope_range: 2000DPS
+    update_interval: 50ms      # 20 Hz feeds the median/EMA chain below
+
+binary_sensor:
+  - platform: template
+    id: gps_fix
+    name: "GPS Fix"
+    device_class: connectivity
+    lambda: |-
+      auto &tg = id(gnss).get_tiny_gps();
+      return tg.location.isValid() && tg.location.age() < 10000;
+
+  - platform: template
+    id: van_is_level
+    name: "Van Is Level"
+    icon: "mdi:spirit-level"
+    lambda: 'return g_lvl.guidance_available && g_lvl.is_level;'
+
+  - platform: template
+    id: van_moving
+    name: "Moving"
+    device_class: moving
+    lambda: 'return g_is_moving;'
+
+sensor:
+  # --- PMIC / battery ---------------------------------------------------------
+  - platform: axp2101
+    id: axp2101_sensor
+    battery_level:
+      id: batt_level
+      name: "Battery Level"
+    battery_voltage:
+      id: batt_voltage
+      name: "Battery Voltage"
+    axp_temperature:
+      id: axp_temp
+      name: "AXP2101 Temperature"
+    battery_charging:
+      id: batt_charging
+      name: "Battery Charging"
+
+  # --- BMP280 barometer (GNSS module, 0x76) -----------------------------------
+  - platform: bmp280_i2c
+    i2c_id: bsp_bus
+    address: 0x76
+    update_interval: 10s
+    iir_filter: 16x
+    temperature:
+      id: baro_temp
+      name: "Barometer Temperature"
+    pressure:
+      id: baro_press
+      name: "Pressure"
+
+  # --- BMI270 IMU (GNSS module, 0x69) -----------------------------------------
+  - platform: motion
+    motion_id: imu
+    type: acceleration_x
+    id: acc_x
+    name: "Accel X"
+    filters: [throttle: 5s]
+  - platform: motion
+    motion_id: imu
+    type: acceleration_y
+    id: acc_y
+    name: "Accel Y"
+    filters: [throttle: 5s]
+  - platform: motion
+    motion_id: imu
+    type: acceleration_z
+    id: acc_z
+    name: "Accel Z"
+    filters: [throttle: 5s]
+  - platform: motion
+    motion_id: imu
+    type: gyroscope_x
+    id: gyr_x
+    name: "Gyro X"
+    filters: [throttle: 5s]
+  - platform: motion
+    motion_id: imu
+    type: gyroscope_y
+    id: gyr_y
+    name: "Gyro Y"
+    filters: [throttle: 5s]
+  - platform: motion
+    motion_id: imu
+    type: gyroscope_z
+    id: gyr_z
+    name: "Gyro Z"
+    filters: [throttle: 5s]
+  # Fast internal path for the level display and the beeper. This is LevelUp's
+  # imu_task.c filter chain: median-5 spike rejection then an EMA. ESPHome has
+  # both natively, so only the deadband/hysteresis stage stays as vendored C.
+  - platform: motion
+    motion_id: imu
+    type: pitch
+    id: imu_pitch
+    internal: true
+    filters:
+      - median: {window_size: 5, send_every: 1, send_first_at: 1}
+      - exponential_moving_average: {alpha: 0.3, send_every: 1}
+  - platform: motion
+    motion_id: imu
+    type: roll
+    id: imu_roll
+    internal: true
+    filters:
+      - median: {window_size: 5, send_every: 1, send_first_at: 1}
+      - exponential_moving_average: {alpha: 0.3, send_every: 1}
+
+  # Throttled copies for Home Assistant — van frame, after deadband.
+  - platform: template
+    id: van_tilt_side
+    name: "Tilt Left-High"
+    unit_of_measurement: "°"
+    accuracy_decimals: 2
+    update_interval: 10s
+    lambda: 'return g_lvl.guidance_available ? g_lvl.left_high_deg : NAN;'
+  - platform: template
+    id: van_tilt_end
+    name: "Tilt Front-High"
+    unit_of_measurement: "°"
+    accuracy_decimals: 2
+    update_interval: 10s
+    lambda: 'return g_lvl.guidance_available ? g_lvl.front_high_deg : NAN;'
+
+  # Leveling guidance for Home Assistant.
+  - platform: template
+    id: lift_fl
+    name: "Lift Front Left"
+    unit_of_measurement: in
+    accuracy_decimals: 2
+    update_interval: 10s
+    lambda: 'return g_lvl.guidance_available ? g_lvl.corner_lift_in[CORNER_FL] : NAN;'
+  - platform: template
+    id: lift_fr
+    name: "Lift Front Right"
+    unit_of_measurement: in
+    accuracy_decimals: 2
+    update_interval: 10s
+    lambda: 'return g_lvl.guidance_available ? g_lvl.corner_lift_in[CORNER_FR] : NAN;'
+  - platform: template
+    id: lift_rl
+    name: "Lift Rear Left"
+    unit_of_measurement: in
+    accuracy_decimals: 2
+    update_interval: 10s
+    lambda: 'return g_lvl.guidance_available ? g_lvl.corner_lift_in[CORNER_RL] : NAN;'
+  - platform: template
+    id: lift_rr
+    name: "Lift Rear Right"
+    unit_of_measurement: in
+    accuracy_decimals: 2
+    update_interval: 10s
+    lambda: 'return g_lvl.guidance_available ? g_lvl.corner_lift_in[CORNER_RR] : NAN;'
+  - platform: template
+    id: lift_max
+    name: "Max Lift Needed"
+    unit_of_measurement: in
+    accuracy_decimals: 2
+    update_interval: 10s
+    lambda: 'return g_lvl.guidance_available ? g_lvl.max_lift_in : NAN;'
+  - platform: bmi270
+    bmi270_id: imu
+    type: temperature
+    id: imu_temp
+    name: "IMU Temperature"
+    filters: [throttle: 30s]
+
+  # --- Host ------------------------------------------------------------------
+  - platform: wifi_signal
+    id: wifi_rssi
+    name: "WiFi Signal"
+    update_interval: 30s
+  - platform: uptime
+    id: sys_uptime
+    name: "Uptime"
+    update_interval: 10s
+
+text_sensor:
+  - platform: template
+    id: guidance_text
+    name: "Leveling Guidance"
+    icon: "mdi:sign-direction"
+    update_interval: 10s
+    lambda: |-
+      const auto &g = g_lvl;
+      char b[64];
+      if (!g.guidance_available) return std::string("Set van dimensions");
+      if (g.is_level)            return std::string("Level");
+      if (id(level_mode).active_index().value_or(0) == 1) {
+        const char *where = g.ramp_axis_is_roll
+            ? (g.ramp_lift_left ? "left wheels" : "right wheels")
+            : (g.ramp_lift_front ? "front wheels" : "rear wheels");
+        snprintf(b, sizeof(b), "Ramp under %s %.1f in", where, g.ramp_target_in);
+      } else {
+        snprintf(b, sizeof(b), "Raise %s %.1f in",
+                 leveling_corner_name(g.worst_corner), g.max_lift_in);
+      }
+      return std::string(b);
+
+  - platform: wifi_info
+    ip_address:
+      id: wifi_ip
+      name: "IP Address"
+    ssid:
+      id: wifi_ssid
+      name: "SSID"
+
+# -----------------------------------------------------------------------------
+#  Van configuration — replaces LevelUp's captive-portal wizard.
+#  These show up in Home Assistant AND in ESPHome's own web server, so the
+#  device stays configurable if HA is down.
+# -----------------------------------------------------------------------------
+number:
+  - platform: template
+    id: van_trackwidth
+    name: "Track Width"
+    icon: "mdi:arrow-left-right"
+    unit_of_measurement: in
+    min_value: 30
+    max_value: 120
+    step: 0.5
+    initial_value: 68
+    restore_value: true
+    optimistic: true
+    mode: box
+    entity_category: config
+  - platform: template
+    id: van_wheelbase
+    name: "Wheelbase"
+    icon: "mdi:arrow-up-down"
+    unit_of_measurement: in
+    min_value: 60
+    max_value: 300
+    step: 0.5
+    initial_value: 148
+    restore_value: true
+    optimistic: true
+    mode: box
+    entity_category: config
+  - platform: template
+    id: beep_volume
+    name: "Beeper Volume"
+    icon: "mdi:volume-high"
+    unit_of_measurement: "%"
+    min_value: 0
+    max_value: 100
+    step: 5
+    initial_value: 60
+    restore_value: true
+    optimistic: true
+    entity_category: config
+    on_value:
+      - lambda: 'id(beeper).set_gain(x / 100.0f);'
+
+select:
+  - platform: template
+    id: van_front
+    name: "Front Of Van"
+    icon: "mdi:van-passenger"
+    options:
+      - "Top of screen"
+      - "Bottom of screen"
+      - "Left of screen"
+      - "Right of screen"
+    initial_option: "Top of screen"
+    restore_value: true
+    optimistic: true
+    entity_category: config
+  - platform: template
+    id: level_mode
+    name: "Leveling Mode"
+    icon: "mdi:car-lifted-pickup"
+    options: ["Blocks", "Ramps"]
+    initial_option: "Blocks"
+    restore_value: true
+    optimistic: true
+    entity_category: config
+
+button:
+  - platform: template
+    id: btn_zero
+    name: "Zero Level Here"
+    icon: "mdi:target"
+    on_press:
+      - if:
+          condition:
+            lambda: 'return g_is_moving;'
+          then:
+            - logger.log:
+                level: WARN
+                format: "Refusing to zero while moving"
+          else:
+            # Rotates the IMU calibration matrix so the current attitude reads
+            # flat, and persists it to NVS. Replaces LevelUp's nvs_load_offsets
+            # / nvs_save_offsets / ui_apply_offsets entirely.
+            - motion.calibrate_level:
+                id: imu
+                save: true
+                on_success:
+                  - lambda: 'g_roll_latched = false; g_pitch_latched = false;'
+                  - logger.log: "Zeroed and saved"
+                on_error:
+                  - logger.log:
+                      level: ERROR
+                      format: "Zero failed"
+  - platform: template
+    id: btn_clear_cal
+    name: "Clear Level Calibration"
+    icon: "mdi:target-variant"
+    entity_category: config
+    on_press:
+      - motion.clear_calibration:
+          id: imu
+          save: true
+
+# -----------------------------------------------------------------------------
+#  Audio — AW88298 amp on the internal I2C bus, speaker on the shared I2S bus.
+#  GPIO13 is I2S DOUT; safe only because the GNSS module uses TXD switch 4
+#  (G17). TXD switch 3 would put the GNSS on G13 and collide here.
+# -----------------------------------------------------------------------------
+i2s_audio:
+  id: i2s_bus
+  i2s_lrclk_pin: GPIO33
+  i2s_bclk_pin: GPIO34
+  i2s_mclk_pin:
+    number: GPIO0
+    ignore_strapping_warning: true
+
+audio_dac:
+  - platform: aw88298
+    id: aw88298_dac
+    i2c_id: bsp_bus
+    sample_rate: 48000
+
+speaker:
+  - platform: i2s_audio
+    id: i2s_speaker
+    i2s_audio_id: i2s_bus
+    dac_type: external
+    i2s_dout_pin: GPIO13
+    audio_dac: aw88298_dac
+
+rtttl:
+  id: beeper
+  speaker: i2s_speaker
+  gain: 60%
+
+# -----------------------------------------------------------------------------
+#  Leveling loop + adaptive beeper
+#  Cadence curve is LevelUp's audio_beep_interval_ms(): 120 ms at 8 deg of
+#  error out to 1200 ms at level, with the fast "centered" cadence suppressed
+#  while moving.
+# -----------------------------------------------------------------------------
+interval:
+  - interval: 100ms
+    id: leveling_tick
+    then:
+      - lambda: |-
+          // GNSS ground speed is a far better "stationary" signal than the
+          // accel-magnitude variance detector LevelUp used. No fix -> assume
+          // parked, since leveling only happens stopped.
+          auto &tg = id(gnss).get_tiny_gps();
+          bool have_fix = tg.location.isValid() && tg.location.age() < 10000;
+          g_is_moving = have_fix && tg.speed.isValid() && tg.speed.kmph() > 3.0f;
+          bool stationary = !g_is_moving;
+
+          float r = id(imu_roll).state;
+          float p = id(imu_pitch).state;
+          if (std::isnan(r) || std::isnan(p)) return;
+
+          r = leveling_deadband_hyst(r, 0.8f, 1.2f, stationary, &g_roll_latched);
+          p = leveling_deadband_hyst(p, 0.8f, 1.2f, stationary, &g_pitch_latched);
+
+          leveling_orient_t o = leveling_orient_from_front(
+              (leveling_front_t) id(van_front).active_index().value_or(0));
+          leveling_mode_t m = (id(level_mode).active_index().value_or(0) == 1)
+                              ? LEVEL_MODE_RAMPS : LEVEL_MODE_BLOCKS;
+
+          g_lvl = leveling_compute(r, p,
+                                     id(van_trackwidth).state,
+                                     id(van_wheelbase).state,
+                                     m, o);
+
+          // --- adaptive beeper ---
+          if (id(beep_mute).state || !g_lvl.guidance_available) return;
+          uint32_t iv = leveling_beep_interval_ms(g_lvl.left_high_deg,
+                                                  g_lvl.front_high_deg,
+                                                  stationary);
+          uint32_t now = esphome::millis();
+          if (now - g_last_beep_ms >= iv) {
+            g_last_beep_ms = now;
+            id(beeper).play("lvl:d=32,o=6,b=200:d");
+          }
+
+# -----------------------------------------------------------------------------
+#  Display
+# -----------------------------------------------------------------------------
+color:
+  - {id: c_bg,     hex: "101418"}
+  - {id: c_panel,  hex: "1B2128"}
+  - {id: c_fg,     hex: "E8EDF2"}
+  - {id: c_muted,  hex: "7A8794"}
+  - {id: c_accent, hex: "35C46A"}
+  - {id: c_warn,   hex: "E0A030"}
+  - {id: c_bad,    hex: "E05252"}
+
+font:
+  - file: {type: gfonts, family: Figtree, weight: 700}
+    id: f_head
+    size: 15
+    glyphsets: [GF_Latin_Core]
+  - file: {type: gfonts, family: Figtree, weight: 600}
+    id: f_label
+    size: 11
+    glyphsets: [GF_Latin_Core]
+    glyphs: ["°"]
+  - file: {type: gfonts, family: "Roboto Mono", weight: 500}
+    id: f_val
+    size: 17
+    glyphsets: [GF_Latin_Core]
+    ignore_missing_glyphs: true
+    glyphs: ["°"]
+  - file: {type: gfonts, family: "Roboto Mono", weight: 700}
+    id: f_big
+    size: 20
+    glyphsets: [GF_Latin_Core]
+    ignore_missing_glyphs: true
+  - file: {type: gfonts, family: Figtree, weight: 700}
+    id: f_mid
+    size: 20
+    glyphsets: [GF_Latin_Core]
+  - file: {type: gfonts, family: "Roboto Mono", weight: 700}
+    id: f_huge
+    size: 30
+    glyphsets: [GF_Latin_Core]
+    ignore_missing_glyphs: true
+  - file: {type: gfonts, family: "Roboto Mono", weight: 400}
+    id: f_tiny
+    size: 12
+    glyphsets: [GF_Latin_Core]
+    ignore_missing_glyphs: true
+    glyphs: ["°"]
+
+display:
+  - platform: mipi_spi
+    model: M5CORE           # ILI9342C, 320x240
+    id: lcd
+    spi_id: spi_bus
+    dc_pin: GPIO35
+    cs_pin:
+      number: GPIO3
+      ignore_strapping_warning: true
+    reset_pin:
+      aw9523b_id: aw9523b_hub
+      number: 9             # P1_1 = LCD_RST
+    data_rate: 40MHz
+    invert_colors: true
+    update_interval: 250ms   # bubble needs to track; full-frame redraw ~31ms
+    pages:
+      # --------------------------------------------------------------- LEVEL --
+      - id: page_level
+        lambda: |-
+          const auto &g = g_lvl;
+          bool ok   = g.guidance_available;
+          bool lev  = ok && g.is_level;
+
+          it.fill(id(c_bg));
+          it.filled_rectangle(0, 0, 320, 24,
+                              !ok ? id(c_bad) : (lev ? id(c_accent) : id(c_warn)));
+          it.print(6, 3, id(f_head), id(c_bg), "LEVEL");
+          it.print(74, 5, id(f_label), id(c_bg),
+                   !ok ? "SET DIMENSIONS" : (lev ? "LEVEL" : "ADJUST"));
+          if (g_is_moving)
+            it.print(150, 5, id(f_label), id(c_bg), "MOVING");
+          if (id(batt_level).has_state())
+            it.printf(314, 5, id(f_label), id(c_bg), TextAlign::TOP_RIGHT,
+                      "%.0f%%", id(batt_level).state);
+
+          // ---- bubble vial -------------------------------------------------
+          // NB: do not name these BX/BY/BR — xtensa's specreg.h defines BR as a macro.
+          const int BUB_X = 76, BUB_Y = 136, BUB_R = 62;
+          it.print(76, 40, id(f_label), id(c_muted), TextAlign::TOP_CENTER, "FRONT");
+          it.line(BUB_X - BUB_R, BUB_Y, BUB_X + BUB_R, BUB_Y, id(c_panel));
+          it.line(BUB_X, BUB_Y - BUB_R, BUB_X, BUB_Y + BUB_R, id(c_panel));
+          it.circle(BUB_X, BUB_Y, BUB_R, id(c_muted));
+          it.circle(BUB_X, BUB_Y, 41, id(c_panel));
+          it.circle(BUB_X, BUB_Y, 20, id(c_panel));
+
+          if (ok) {
+            // A bubble floats to the HIGH corner, so the dot moves the same way.
+            const float scale = 62.0f / 6.0f;   // full deflection at 6 deg
+            float dx = -g.left_high_deg  * scale;
+            float dy = -g.front_high_deg * scale;
+            float mag = sqrtf(dx * dx + dy * dy);
+            if (mag > 50.0f) { dx *= 50.0f / mag; dy *= 50.0f / mag; }
+            it.filled_circle(BUB_X + (int) dx, BUB_Y + (int) dy, 11,
+                             lev ? id(c_accent) : id(c_warn));
+          }
+
+          // ---- guidance panel ----------------------------------------------
+          if (!ok) {
+            it.print(154, 60, id(f_mid), id(c_bad), "SET VAN");
+            it.print(154, 84, id(f_mid), id(c_bad), "DIMENSIONS");
+            it.print(154, 116, id(f_tiny), id(c_muted), "Track width and");
+            it.print(154, 132, id(f_tiny), id(c_muted), "wheelbase, in HA");
+          } else if (id(level_mode).active_index().value_or(0) == 1) {
+            // ---- RAMPS ----
+            it.print(154, 30, id(f_label), id(c_muted), "RAMPS - DRIVE ONTO");
+            const char *where = g.ramp_axis_is_roll
+                ? (g.ramp_lift_left ? "LEFT" : "RIGHT")
+                : (g.ramp_lift_front ? "FRONT" : "REAR");
+            if (lev) {
+              it.print(154, 60, id(f_mid), id(c_accent), "NO RAMPS");
+              it.print(154, 86, id(f_mid), id(c_accent), "NEEDED");
+            } else {
+              it.print(154, 56, id(f_mid), id(c_fg), where);
+              it.print(154, 80, id(f_label), id(c_muted), "WHEELS");
+              it.printf(154, 104, id(f_huge), id(c_warn), "%.1f\"", g.ramp_target_in);
+            }
+          } else {
+            // ---- BLOCKS: 2x2 van plan, front at top ----
+            it.print(154, 30, id(f_label), id(c_muted), "BLOCKS - RAISE (in)");
+            const char *cn[4] = {"FL", "FR", "RL", "RR"};
+            const int cx[4] = {154, 236, 154, 236};
+            const int cy[4] = {46, 46, 90, 90};
+            for (int i = 0; i < 4; i++) {
+              bool worst = (!lev && i == (int) g.worst_corner && g.max_lift_in > 0.05f);
+              it.filled_rectangle(cx[i], cy[i], 76, 40,
+                                  worst ? id(c_warn) : id(c_panel));
+              it.print(cx[i] + 5, cy[i] + 3, id(f_label),
+                       worst ? id(c_bg) : id(c_muted), cn[i]);
+              it.printf(cx[i] + 5, cy[i] + 18, id(f_val),
+                        worst ? id(c_bg) : id(c_fg), "%.1f", g.corner_lift_in[i]);
+            }
+            if (lev) {
+              it.print(154, 142, id(f_mid), id(c_accent), "LEVEL");
+            } else {
+              it.printf(154, 140, id(f_label), id(c_muted), "RAISE %s",
+                        leveling_corner_name(g.worst_corner));
+              it.printf(154, 154, id(f_huge), id(c_warn), "%.1f\"", g.max_lift_in);
+            }
+          }
+
+          // ---- footer -------------------------------------------------------
+          it.line(8, 200, 312, 200, id(c_panel));
+          if (ok) {
+            it.printf(8, 206, id(f_tiny), id(c_muted),
+                      "SIDE %+.1f°   END %+.1f°", g.left_high_deg, g.front_high_deg);
+          }
+          it.printf(8, 222, id(f_tiny), id(c_muted), "%s   %s   %s",
+                    id(level_mode).current_option().c_str(),
+                    g_is_moving ? "MOVING" : "PARKED",
+                    id(beep_mute).state ? "MUTED" : "BEEP ON");
+
+      # ---------------------------------------------------------------- GNSS --
+      - id: page_gnss
+        lambda: |-
+          auto &tg = id(gnss).get_tiny_gps();
+          bool fix   = tg.location.isValid() && tg.location.age() < 10000;
+          bool data  = tg.charsProcessed() > 10;
+
+          it.fill(id(c_bg));
+          it.filled_rectangle(0, 0, 320, 24, fix ? id(c_accent) : (data ? id(c_warn) : id(c_bad)));
+          it.print(6, 3, id(f_head), id(c_bg), "GNSS");
+          it.printf(150, 5, id(f_label), id(c_bg), TextAlign::TOP_LEFT, "%s",
+                    fix ? "3D/2D FIX" : (data ? "NMEA, NO FIX" : "NO NMEA"));
+          if (id(batt_level).has_state())
+            it.printf(314, 5, id(f_label), id(c_bg), TextAlign::TOP_RIGHT, "%.0f%%", id(batt_level).state);
+
+          it.print(8, 30, id(f_label), id(c_muted), "LATITUDE");
+          it.print(166, 30, id(f_label), id(c_muted), "LONGITUDE");
+          if (fix) {
+            it.printf(8, 44, id(f_big), id(c_fg), "%11.6f", tg.location.lat());
+            it.printf(166, 44, id(f_big), id(c_fg), "%11.6f", tg.location.lng());
+          } else {
+            it.print(8, 44, id(f_big), id(c_muted), "   --.------");
+            it.print(166, 44, id(f_big), id(c_muted), "   --.------");
+          }
+          it.line(8, 76, 312, 76, id(c_panel));
+
+          // ---- tile grid: 4 across, 2 rows ----
+          const int tx[4] = {8, 86, 164, 242};
+          const char *lbl[8] = {"SATS", "HDOP", "FIX AGE", "SPEED",
+                                "ALTITUDE", "COURSE", "UTC DATE", "UTC TIME"};
+          char buf[8][16];
+          snprintf(buf[0], 16, "%u", (unsigned) tg.satellites.value());
+          if (tg.hdop.isValid()) snprintf(buf[1], 16, "%.2f", tg.hdop.hdop());
+          else                   snprintf(buf[1], 16, "--");
+          if (fix) snprintf(buf[2], 16, "%.1fs", tg.location.age() / 1000.0f);
+          else     snprintf(buf[2], 16, "--");
+          if (tg.speed.isValid())  snprintf(buf[3], 16, "%.1f", tg.speed.kmph());
+          else                     snprintf(buf[3], 16, "--");
+          if (tg.altitude.isValid()) snprintf(buf[4], 16, "%.0fm", tg.altitude.meters());
+          else                       snprintf(buf[4], 16, "--");
+          if (tg.course.isValid()) snprintf(buf[5], 16, "%.0f°", tg.course.deg());
+          else                     snprintf(buf[5], 16, "--");
+          if (tg.date.isValid()) snprintf(buf[6], 16, "%02d-%02d", tg.date.month(), tg.date.day());
+          else                   snprintf(buf[6], 16, "--");
+          if (tg.time.isValid()) snprintf(buf[7], 16, "%02d:%02d:%02d", tg.time.hour(), tg.time.minute(), tg.time.second());
+          else                   snprintf(buf[7], 16, "--:--:--");
+
+          for (int i = 0; i < 8; i++) {
+            int x = tx[i % 4];
+            int y = 84 + (i / 4) * 52;
+            it.filled_rectangle(x, y, 70, 46, id(c_panel));
+            it.print(x + 5, y + 4, id(f_label), id(c_muted), lbl[i]);
+            it.print(x + 5, y + 20, i == 7 ? id(f_tiny) : id(f_val), id(c_fg), buf[i]);
+          }
+
+          it.printf(8, 194, id(f_tiny), id(c_muted),
+                    "chars %lu   fix-sentences %lu   csum-fail %lu",
+                    (unsigned long) tg.charsProcessed(),
+                    (unsigned long) tg.sentencesWithFix(),
+                    (unsigned long) tg.failedChecksum());
+          it.print(8, 222, id(f_tiny), id(c_muted), "tap screen for next page");
+
+      # ------------------------------------------------------------- SENSORS --
+      - id: page_sensors
+        lambda: |-
+          it.fill(id(c_bg));
+          it.filled_rectangle(0, 0, 320, 24, id(c_fg));
+          it.print(6, 3, id(f_head), id(c_bg), "MODULE SENSORS");
+
+          it.print(8, 30, id(f_label), id(c_muted), "BMP280  0x76");
+          it.filled_rectangle(8, 44, 148, 46, id(c_panel));
+          it.print(13, 48, id(f_label), id(c_muted), "TEMPERATURE");
+          if (id(baro_temp).has_state()) it.printf(13, 64, id(f_val), id(c_fg), "%.2f °C", id(baro_temp).state);
+          else                           it.print(13, 64, id(f_val), id(c_muted), "--");
+          it.filled_rectangle(164, 44, 148, 46, id(c_panel));
+          it.print(169, 48, id(f_label), id(c_muted), "PRESSURE");
+          if (id(baro_press).has_state()) it.printf(169, 64, id(f_val), id(c_fg), "%.1f hPa", id(baro_press).state);
+          else                            it.print(169, 64, id(f_val), id(c_muted), "--");
+
+          it.print(8, 98, id(f_label), id(c_muted), "BMI270  0x69");
+          it.filled_rectangle(8, 112, 148, 46, id(c_panel));
+          it.print(13, 116, id(f_label), id(c_muted), "PITCH / ROLL");
+          it.printf(13, 132, id(f_val), id(c_fg), "%+5.1f %+5.1f",
+                    id(imu_pitch).state, id(imu_roll).state);
+          it.filled_rectangle(164, 112, 148, 46, id(c_panel));
+          it.print(169, 116, id(f_label), id(c_muted), "IMU TEMP");
+          if (id(imu_temp).has_state()) it.printf(169, 132, id(f_val), id(c_fg), "%.1f °C", id(imu_temp).state);
+          else                          it.print(169, 132, id(f_val), id(c_muted), "--");
+
+          it.print(8, 166, id(f_label), id(c_muted), "ACCEL  g");
+          it.printf(8, 180, id(f_val), id(c_fg), "%+6.2f %+6.2f %+6.2f",
+                    id(acc_x).state, id(acc_y).state, id(acc_z).state);
+          it.print(8, 202, id(f_label), id(c_muted), "GYRO  °/s");
+          it.printf(8, 216, id(f_val), id(c_fg), "%+7.1f %+7.1f %+7.1f",
+                    id(gyr_x).state, id(gyr_y).state, id(gyr_z).state);
+
+      # -------------------------------------------------------------- SYSTEM --
+      - id: page_system
+        lambda: |-
+          it.fill(id(c_bg));
+          it.filled_rectangle(0, 0, 320, 24, id(c_fg));
+          it.print(6, 3, id(f_head), id(c_bg), "SYSTEM");
+
+          int y = 32;
+          auto row = [&](const char *k, const std::string &v) {
+            it.print(8, y, id(f_label), id(c_muted), k);
+            it.print(120, y - 2, id(f_tiny), id(c_fg), v.c_str());
+            y += 20;
+          };
+          char b[48];
+
+          row("SSID", id(wifi_ssid).state.empty() ? "--" : id(wifi_ssid).state);
+          row("IP", id(wifi_ip).state.empty() ? "--" : id(wifi_ip).state);
+          snprintf(b, sizeof(b), "%.0f dBm", id(wifi_rssi).state);
+          row("RSSI", b);
+
+          uint32_t up = (uint32_t) id(sys_uptime).state;
+          snprintf(b, sizeof(b), "%ud %02u:%02u:%02u", (unsigned) (up / 86400),
+                   (unsigned) ((up % 86400) / 3600), (unsigned) ((up % 3600) / 60),
+                   (unsigned) (up % 60));
+          row("UPTIME", b);
+
+          snprintf(b, sizeof(b), "%.0f%%  %.2f V%s", id(batt_level).state,
+                   id(batt_voltage).state, id(batt_charging).state ? "  charging" : "");
+          row("BATTERY", b);
+
+          snprintf(b, sizeof(b), "%.1f °C", id(axp_temp).state);
+          row("PMIC TEMP", b);
+
+          y += 6;
+          it.line(8, y, 312, y, id(c_panel));
+          y += 10;
+          it.print(8, y, id(f_label), id(c_muted), "GNSS UART  RX G18 / TX G17 @ 38400");
+          y += 18;
+          it.print(8, y, id(f_label), id(c_muted), "I2C  SDA G12 / SCL G11   PORT A  G2 / G1");
+          y += 18;
+          it.print(8, y, id(f_label), id(c_muted), "PORT C CONSUMED BY GNSS MODULE");
+
+# -----------------------------------------------------------------------------
+#  Touch — tap anywhere to cycle pages
+# -----------------------------------------------------------------------------
+touchscreen:
+  - platform: ft63x6
+    id: touch
+    i2c_id: bsp_bus
+    display: lcd
+    # reset handled in on_boot priority 700 — see the note there
+    calibration:
+      x_min: 0
+      x_max: 320
+      y_min: 0
+      y_max: 240
+    on_release:
+      then:
+        - display.page.show_next: lcd
+        - component.update: lcd
