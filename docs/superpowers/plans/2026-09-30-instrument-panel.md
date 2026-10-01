@@ -1204,7 +1204,9 @@ In the `lvgl_tick` lambda, immediately before the comment
             if (py >  80.0f) py =  80.0f;
             if (py < -80.0f) py = -80.0f;
 
-            lv_obj_t *hz = id(att_horizon).obj;
+            lv_obj_t *hz = id(att_horizon);   // plain obj: widgets resolve
+                                              // directly; only wrappers like
+                                              // line: need .obj
             // LVGL angles are in 0.1 degree units. Negated so a raised left
             // side rolls the horizon the way the real instrument does — if it
             // reads backwards on hardware, drop the minus sign.

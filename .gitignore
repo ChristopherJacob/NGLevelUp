@@ -5,3 +5,4 @@ secrets.yaml
 .DS_Store
 lvgl_ui_project/
 OriginalTest.yaml
+m5stack-cores3-gnss.yaml
