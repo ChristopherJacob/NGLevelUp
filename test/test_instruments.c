@@ -119,6 +119,31 @@ static void test_smoothed_rate(void)
                     123.0f, 0.0001f));
 }
 
+static void test_haversine(void)
+{
+    // Zero distance for identical points.
+    assert(close_to(inst_haversine_m(40.0f, -105.0f, 40.0f, -105.0f), 0.0f, 0.1f));
+
+    // One degree of latitude is close to 111.2 km anywhere.
+    float d = inst_haversine_m(40.0f, -105.0f, 41.0f, -105.0f);
+    assert(close_to(d, 111195.0f, 500.0f));
+
+    // Symmetric.
+    float a = inst_haversine_m(40.1f, -105.2f, 40.3f, -105.5f);
+    float b2 = inst_haversine_m(40.3f, -105.5f, 40.1f, -105.2f);
+    assert(close_to(a, b2, 0.5f));
+
+    // A degree of longitude shrinks with latitude.
+    float eq = inst_haversine_m(0.0f, 0.0f, 0.0f, 1.0f);
+    float hi = inst_haversine_m(60.0f, 0.0f, 60.0f, 1.0f);
+    assert(hi < eq * 0.6f);
+
+    // A few metres apart must not round to zero — the odometer depends on it.
+    float small = inst_haversine_m(40.000000f, -105.000000f,
+                                   40.000090f, -105.000000f);
+    assert(small > 5.0f && small < 15.0f);
+}
+
 int main(void)
 {
     test_altitude_zero_when_pressure_equals_setting();
@@ -131,6 +156,7 @@ int main(void)
     test_needle_wrap();
     test_g_magnitude();
     test_smoothed_rate();
+    test_haversine();
     printf("ALL TESTS PASSED\n");
     return 0;
 }

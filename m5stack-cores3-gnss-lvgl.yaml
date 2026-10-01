@@ -134,6 +134,14 @@ web_server:
   local: true
   include_internal: true
 
+# Odometer total. Persisted, but written deliberately rather than continuously —
+# see the flush rules in the levelling loop and on ignition loss.
+globals:
+  - id: odo_total_m
+    type: float
+    restore_value: true
+    initial_value: '0.0'
+
 # -----------------------------------------------------------------------------
 #  M5Stack board-support components (PMIC + IO expander are not in core ESPHome)
 # -----------------------------------------------------------------------------
@@ -386,6 +394,7 @@ binary_sensor:
       - delayed_off: 10s
     on_release:                      # ignition power lost
       then:
+        - script.execute: odo_flush
         - script.execute: sleep_timer
     on_press:                        # ignition power restored
       then:
@@ -528,6 +537,15 @@ sensor:
       auto &tg = id(gnss).get_tiny_gps();
       if (!tg.speed.isValid()) return NAN;
       return inst_kmh_to_mph((float) tg.speed.kmph());
+
+  - platform: template
+    id: odo_miles
+    name: "Odometer"
+    unit_of_measurement: mi
+    accuracy_decimals: 1
+    update_interval: 60s
+    icon: "mdi:counter"
+    lambda: 'return (id(odo_total_m) + (float) g_odo_pend_m) / 1609.344f;'
 
   # Tilt as a height difference across each axis — LevelUp's roll_in / pitch_in.
   # tan(angle) * the span the angle acts over. This is the total difference
@@ -797,6 +815,20 @@ button:
             call.perform();
             ESP_LOGI("alt", "setting -> %.2f inHg from GPS %.0f ft", inhg, gps_ft);
 
+  - platform: template
+    id: btn_odo_reset
+    name: "Reset Odometer"
+    icon: "mdi:counter"
+    entity_category: config
+    on_press:
+      then:
+        - lambda: |-
+            id(odo_total_m) = 0.0f;
+            g_odo_pend_m = 0.0;
+            g_odo_last_lat = NAN;
+            g_odo_last_lon = NAN;
+            ESP_LOGI("odo", "reset");
+
 # -----------------------------------------------------------------------------
 #  Runtime log level. The select only persists the *choice*; the logger itself
 #  always starts at `initial_level`, so re-apply it once at boot.
@@ -842,6 +874,17 @@ script:
       - light.turn_on:
           id: lcd_backlight
           brightness: 80%
+
+  # Fold the pending metres into the persisted total. Called every 5 minutes
+  # and when the ignition goes off, rather than on every fix: at one write per
+  # GNSS update this would be thousands of NVS writes an hour.
+  - id: odo_flush
+    then:
+      - lambda: |-
+          if (g_odo_pend_m <= 0.0) return;
+          id(odo_total_m) += (float) g_odo_pend_m;
+          g_odo_pend_m = 0.0;
+          ESP_LOGI("odo", "flushed, total %.1f km", id(odo_total_m) / 1000.0f);
 
 # -----------------------------------------------------------------------------
 #  Audio — AW88298 amp on the internal I2C bus, speaker on the shared I2S bus.
@@ -929,6 +972,25 @@ interval:
                                      id(van_trackwidth).state,
                                      id(van_wheelbase).state,
                                      m, o);
+
+          // --- trip odometer ---
+          // Only count movement while actually moving and with a usable fix:
+          // a stationary receiver wanders by metres, which would otherwise
+          // clock up kilometres overnight.
+          if (have_fix && g_is_moving && tg.hdop.isValid() && tg.hdop.hdop() < 5.0f) {
+            float la = (float) tg.location.lat();
+            float lo = (float) tg.location.lng();
+            if (!std::isnan(g_odo_last_lat)) {
+              float step = inst_haversine_m(g_odo_last_lat, g_odo_last_lon, la, lo);
+              // Reject absurd jumps (a fix glitch) and sub-metre jitter.
+              if (step > 1.0f && step < 1000.0f) g_odo_pend_m += step;
+            }
+            g_odo_last_lat = la;
+            g_odo_last_lon = lo;
+          } else if (!g_is_moving) {
+            g_odo_last_lat = NAN;   // restart the chain when stopping
+            g_odo_last_lon = NAN;
+          }
 
           // --- LED bar as a level indicator ---
           // Visible from the driver's seat and from outside while someone spots
@@ -1275,6 +1337,9 @@ interval:
                    id(batt_level).state, id(batt_voltage).state,
                    id(batt_charging).state ? "  charging" : "");
           lv_label_set_text(id(lbl_sys_e), b);
+          snprintf(b, sizeof(b), "ODO    %.1f mi",
+                   (id(odo_total_m) + (float) g_odo_pend_m) / 1609.344f);
+          lv_label_set_text(id(lbl_sys_odo), b);
       - lvgl.indicator.update:
           id: alt_needle_100
           value: !lambda 'return std::isnan(g_alt_ft) ? 0.0f : inst_alt_needle(g_alt_ft, 1000.0f);'
@@ -1298,6 +1363,11 @@ interval:
             if (g > 30.0f) g = 30.0f;
             if (g < 0.0f)  g = 0.0f;
             return g;
+
+  - interval: 5min
+    id: odo_tick
+    then:
+      - script.execute: odo_flush
 
 # Fonts — LVGL references these by id via `text_font:`.
 font:
@@ -1994,6 +2064,7 @@ lvgl:
         - label: {id: lbl_sys_c, x: 8, y: 78,  text: "", text_font: f_tiny, text_color: 0xE8EDF2}
         - label: {id: lbl_sys_d, x: 8, y: 100, text: "", text_font: f_tiny, text_color: 0xE8EDF2}
         - label: {id: lbl_sys_e, x: 8, y: 122, text: "", text_font: f_tiny, text_color: 0xE8EDF2}
+        - label: {id: lbl_sys_odo, x: 8, y: 140, text: "", text_font: f_tiny, text_color: 0xE8EDF2}
         - label: {x: 8, y: 160, text: "GNSS UART  RX G18 / TX G17 @ 38400", text_font: f_tiny, text_color: 0x7A8794}
         - label: {x: 8, y: 180, text: "I2C  SDA G12 / SCL G11   PORT A  G2 / G1", text_font: f_tiny, text_color: 0x7A8794}
         - label: {x: 8, y: 200, text: "PORT C CONSUMED BY GNSS MODULE", text_font: f_tiny, text_color: 0x7A8794}

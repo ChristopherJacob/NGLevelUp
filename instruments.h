@@ -92,6 +92,25 @@ static inline float inst_smooth_rate_per_min(float value, float prev_value,
     return prev_rate + alpha * (inst - prev_rate);
 }
 
+#define INST_EARTH_R_M  6371008.8f   /* IUGG mean radius */
+
+/* Great-circle distance in metres. Computed in double internally: at van
+   speeds consecutive fixes are metres apart, and float latitudes lose enough
+   precision in the subtraction to swallow a short step entirely. */
+static inline float inst_haversine_m(float lat1, float lon1,
+                                     float lat2, float lon2)
+{
+    const double D2R = 0.017453292519943295;
+    double p1 = (double) lat1 * D2R, p2 = (double) lat2 * D2R;
+    double dp = p2 - p1;
+    double dl = ((double) lon2 - (double) lon1) * D2R;
+    double sdp = sin(dp * 0.5), sdl = sin(dl * 0.5);
+    double a = sdp * sdp + cos(p1) * cos(p2) * sdl * sdl;
+    if (a < 0.0) a = 0.0;
+    if (a > 1.0) a = 1.0;
+    return (float) (2.0 * (double) INST_EARTH_R_M * asin(sqrt(a)));
+}
+
 #ifdef __cplusplus
 }  /* extern "C" */
 #endif

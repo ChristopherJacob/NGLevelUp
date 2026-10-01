@@ -268,4 +268,7 @@ inline float    g_alt_ft        = NAN;   // barometric altitude, feet
 inline float    g_vsi_fpm       = 0.0f;  // smoothed vertical speed, ft/min
 inline float    g_vsi_prev_ft   = NAN;   // previous altitude sample
 inline uint32_t g_vsi_prev_ms   = 0;     // when that sample was taken
+inline double   g_odo_pend_m    = 0.0;   // metres not yet flushed to NVS
+inline float    g_odo_last_lat  = NAN;   // previous accepted fix
+inline float    g_odo_last_lon  = NAN;
 #endif
