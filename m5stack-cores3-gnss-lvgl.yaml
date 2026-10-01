@@ -471,6 +471,17 @@ sensor:
     id: gyr_z
     name: "Gyro Z"
     filters: [throttle: 5s]
+  # Fast lateral acceleration for the slip/skid ball. The HA-facing acc_x is
+  # throttled to 5 s, which would make the ball lurch once every five seconds.
+  - platform: motion
+    motion_id: imu
+    type: acceleration_x
+    id: acc_x_fast
+    internal: true
+    filters:
+      - median: {window_size: 5, send_every: 1, send_first_at: 1}
+      - exponential_moving_average: {alpha: 0.2, send_every: 1}
+
   # Fast internal path for the level display and the beeper. This is LevelUp's
   # imu_task.c filter chain: median-5 spike rejection then an EMA. ESPHome has
   # both natively, so only the deadband/hysteresis stage stays as vendored C.
@@ -1183,6 +1194,44 @@ interval:
                                                     : "no GPS altitude");
           }
 
+          // ---- ATTITUDE page ----
+          {
+            // Van-frame angles, so the horizon agrees with the LEVEL page.
+            float p_deg = g_lvl.guidance_available ? g_lvl.front_high_deg : 0.0f;
+            float r_deg = g_lvl.guidance_available ? g_lvl.left_high_deg  : 0.0f;
+
+            // 3 px per degree, clamped so the horizon cannot leave the ball.
+            float py = p_deg * 3.0f;
+            if (py >  80.0f) py =  80.0f;
+            if (py < -80.0f) py = -80.0f;
+
+            lv_obj_t *hz = id(att_horizon);
+            // LVGL angles are in 0.1 degree units. Negated so a raised left
+            // side rolls the horizon the way the real instrument does -- if it
+            // reads backwards on hardware, drop the minus sign.
+            lv_obj_set_style_transform_rotation(hz, (int32_t) (-r_deg * 10.0f),
+                                                LV_PART_MAIN);
+            lv_obj_align(hz, LV_ALIGN_CENTER, 0, (int32_t) py);
+
+            // Slip/skid ball: lateral acceleration, 1 g over half the tube.
+            float lat_g = id(acc_x_fast).has_state() ? id(acc_x_fast).state : 0.0f;
+            float bx = lat_g * 50.0f;
+            if (bx >  48.0f) bx =  48.0f;
+            if (bx < -48.0f) bx = -48.0f;
+            lv_obj_align(id(att_ball_slip), LV_ALIGN_CENTER, (int32_t) bx, 0);
+
+            snprintf(b, sizeof(b), "%+.1f\u00B0", p_deg);
+            lv_label_set_text(id(lbl_att_pitch), b);
+            snprintf(b, sizeof(b), "%+.1f\u00B0", r_deg);
+            lv_label_set_text(id(lbl_att_roll), b);
+            snprintf(b, sizeof(b), "%+.2f g", lat_g);
+            lv_label_set_text(id(lbl_att_lat), b);
+            lv_label_set_text(id(lbl_att_hdr),
+                              g_lvl.guidance_available ? "" : "SET DIMENSIONS");
+            lv_label_set_text(id(lbl_att_note),
+                              fabsf(lat_g) < 0.03f ? "centred" : "");
+          }
+
           // ---- SYSTEM page ----
           snprintf(b, sizeof(b), "SSID   %s",
                    id(wifi_ssid).state.empty() ? "--" : id(wifi_ssid).state.c_str());
@@ -1601,6 +1650,171 @@ lvgl:
         - label: {id: lbl_alt_gps,  x: 208, y: 154, text: "--",  text_font: f_val,  text_color: 0xE8EDF2}
         - label: {id: lbl_alt_hpa,  x: 208, y: 186, text: "",    text_font: f_tiny, text_color: 0x7A8794}
         - label: {id: lbl_alt_note, x: 208, y: 204, text: "",    text_font: f_tiny, text_color: 0x7A8794}
+
+    # -------------------------------------------------------------- ATTITUDE --
+    # Artificial horizon from the same calibrated pitch/roll the LEVEL page
+    # uses, plus a slip/skid ball. The ball is driven by lateral acceleration
+    # rather than by roll angle, so it reads tilt while parked AND cornering
+    # while driving -- which is what the real instrument does.
+    - id: pg_att
+      bg_color: 0x101418
+      bg_opa: COVER
+      on_swipe_left:
+        - lvgl.page.next:
+            animation: MOVE_LEFT
+            time: 200ms
+      on_swipe_right:
+        - lvgl.page.previous:
+            animation: MOVE_RIGHT
+            time: 200ms
+      widgets:
+        - obj:
+            x: 0
+            y: 0
+            width: 320
+            height: 24
+            radius: 0
+            border_width: 0
+            pad_all: 0
+            bg_color: 0x7A8794
+            bg_opa: COVER
+            widgets:
+              - label: {x: 6, y: 4, text: "ATTITUDE", text_font: f_head, text_color: 0x101418}
+              - label: {id: lbl_att_hdr, x: 110, y: 6, text: "", text_font: f_label, text_color: 0x101418}
+
+        # ---- horizon ball ----
+        # clip_corner is what keeps the rotated child inside the circle.
+        - obj:
+            id: att_ball
+            x: 14
+            y: 34
+            width: 190
+            height: 190
+            radius: 95
+            clip_corner: true
+            pad_all: 0
+            bg_color: 0x101418
+            bg_opa: COVER
+            border_color: 0x7A8794
+            border_width: 2
+            widgets:
+              # Oversized so no corner can rotate into view: the parent's
+              # diagonal is 269 px, this is 300.
+              - obj:
+                  id: att_horizon
+                  align: CENTER
+                  width: 300
+                  height: 300
+                  radius: 0
+                  pad_all: 0
+                  border_width: 0
+                  bg_opa: TRANSP
+                  transform_pivot_x: 150
+                  transform_pivot_y: 150
+                  widgets:
+                    - obj:
+                        x: 0
+                        y: 0
+                        width: 300
+                        height: 150
+                        radius: 0
+                        border_width: 0
+                        pad_all: 0
+                        bg_color: 0x2E6FA8
+                        bg_opa: COVER
+                    - obj:
+                        x: 0
+                        y: 150
+                        width: 300
+                        height: 150
+                        radius: 0
+                        border_width: 0
+                        pad_all: 0
+                        bg_color: 0x7A5230
+                        bg_opa: COVER
+                    - obj:
+                        x: 0
+                        y: 148
+                        width: 300
+                        height: 3
+                        radius: 0
+                        border_width: 0
+                        pad_all: 0
+                        bg_color: 0xE8EDF2
+                        bg_opa: COVER
+              # Fixed aircraft reference, drawn over the moving horizon.
+              - obj:
+                  align: CENTER
+                  width: 64
+                  height: 3
+                  radius: 0
+                  border_width: 0
+                  pad_all: 0
+                  bg_color: 0xE0A030
+                  bg_opa: COVER
+              - obj:
+                  align: CENTER
+                  width: 3
+                  height: 3
+                  radius: 0
+                  border_width: 0
+                  pad_all: 0
+                  bg_color: 0xE0A030
+                  bg_opa: COVER
+
+        # ---- slip/skid ball, in its curved-tube surround ----
+        - obj:
+            id: att_tube
+            x: 44
+            y: 196
+            width: 130
+            height: 26
+            radius: 13
+            pad_all: 0
+            bg_color: 0x1B2128
+            bg_opa: COVER
+            border_color: 0x7A8794
+            border_width: 1
+            widgets:
+              - obj:
+                  align: CENTER
+                  x: -11
+                  width: 2
+                  height: 20
+                  radius: 0
+                  border_width: 0
+                  pad_all: 0
+                  bg_color: 0x7A8794
+                  bg_opa: COVER
+              - obj:
+                  align: CENTER
+                  x: 11
+                  width: 2
+                  height: 20
+                  radius: 0
+                  border_width: 0
+                  pad_all: 0
+                  bg_color: 0x7A8794
+                  bg_opa: COVER
+              - obj:
+                  id: att_ball_slip
+                  align: CENTER
+                  width: 18
+                  height: 18
+                  radius: 9
+                  pad_all: 0
+                  border_width: 0
+                  bg_color: 0xE8EDF2
+                  bg_opa: COVER
+
+        # ---- readouts ----
+        - label: {x: 212, y: 40,  text: "PITCH",  text_font: f_label, text_color: 0x7A8794}
+        - label: {id: lbl_att_pitch, x: 212, y: 54,  text: "--", text_font: f_val, text_color: 0xE8EDF2}
+        - label: {x: 212, y: 84,  text: "ROLL",   text_font: f_label, text_color: 0x7A8794}
+        - label: {id: lbl_att_roll,  x: 212, y: 98,  text: "--", text_font: f_val, text_color: 0xE8EDF2}
+        - label: {x: 212, y: 128, text: "LATERAL", text_font: f_label, text_color: 0x7A8794}
+        - label: {id: lbl_att_lat,   x: 212, y: 142, text: "--", text_font: f_val, text_color: 0xE8EDF2}
+        - label: {id: lbl_att_note,  x: 212, y: 196, text: "", text_font: f_tiny, text_color: 0x7A8794}
 
     # --------------------------------------------------------------- SYSTEM --
     - id: pg_sys
