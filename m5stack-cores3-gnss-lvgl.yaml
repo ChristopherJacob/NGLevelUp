@@ -298,6 +298,14 @@ switch:
     restore_mode: RESTORE_DEFAULT_ON
     entity_category: config
 
+  - platform: template       # dim the screen between dusk and dawn
+    id: night_dim
+    name: "Night Dimming"
+    icon: "mdi:weather-night"
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    entity_category: config
+
   - platform: template       # silence the leveling beeper
     id: beep_mute            # ON = muted. Defaults to muted on a device with no
     name: "Beeper Muted"     # stored state; otherwise the last choice is restored.
@@ -339,6 +347,7 @@ time:
   - platform: gps          # UTC from the NEO-M9N once it has a fix
     id: gps_time
     gps_id: gnss
+    timezone: America/Denver
     on_time_sync:
       then:
         - bm8563.write_time:   # push GNSS time into the BM8563 RTC
@@ -714,6 +723,28 @@ number:
     mode: box
     entity_category: config
 
+  - platform: template
+    id: bright_day
+    name: "Day Brightness"
+    unit_of_measurement: "%"
+    min_value: 10
+    max_value: 100
+    step: 5
+    initial_value: 80
+    restore_value: true
+    optimistic: true
+    entity_category: config
+  - platform: template
+    id: bright_night
+    name: "Night Brightness"
+    unit_of_measurement: "%"
+    min_value: 1
+    max_value: 60
+    step: 1
+    initial_value: 15
+    restore_value: true
+    optimistic: true
+    entity_category: config
 select:
   - platform: template
     id: van_front
@@ -1368,6 +1399,29 @@ interval:
     id: odo_tick
     then:
       - script.execute: odo_flush
+
+  # Brightness follows local clock hour. The GNSS time source is UTC, so this
+  # needs the timezone set; without it the thresholds are simply wrong by the
+  # UTC offset rather than broken.
+  - interval: 60s
+    id: bright_tick
+    then:
+      - if:
+          condition:
+            lambda: 'return !g_asleep;'
+          then:
+            - lambda: |-
+                float pct = id(bright_day).state;
+                if (id(night_dim).state) {
+                  auto t = id(gps_time).now();
+                  if (t.is_valid() && (t.hour >= 20 || t.hour < 6)) {
+                    pct = id(bright_night).state;
+                  }
+                }
+                auto call = id(lcd_backlight).turn_on();
+                call.set_brightness(pct / 100.0f);
+                call.set_transition_length(2000);
+                call.perform();
 
 # Fonts — LVGL references these by id via `text_font:`.
 font:
